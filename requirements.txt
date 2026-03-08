@@ -1,0 +1,21 @@
+# DeepSeek Client - Dependencias principales
+
+# Selenium y anti-detección
+undetected-chromedriver>=3.5.4
+selenium>=4.15.0
+
+# Interfaz de terminal interactiva
+rich>=13.5.0
+
+# Servidor API (opcional)
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Utilidades
+python-dotenv>=1.0.0
+
+# Opcionales para desarrollo
+# pytest>=7.4.0
+# pytest-asyncio>=0.21.0
+# black>=23.0.0
+# mypy>=1.5.0
