@@ -1,0 +1,18 @@
+{
+    "is_running": true,
+    "pool_size": 1,
+    "total_drivers": 1,
+    "available_drivers": 1,
+    "busy_drivers": 0,
+    "drivers": [
+        {
+            "id": 1,
+            "profile": "linux_dev",
+            "is_busy": false,
+            "task_count": 0,
+            "error_count": 0,
+            "age": 0.000118255615234375,
+            "idle_time": 0.00011754035949707031
+        }
+    ]
+}

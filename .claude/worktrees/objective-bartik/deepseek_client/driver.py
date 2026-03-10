@@ -85,7 +85,6 @@ class AntiDetectionDriver:
     
     _instance: Optional['AntiDetectionDriver'] = None
     _driver = None
-    _init_lock = __import__('threading').Lock()  # Prevent WinError 32 on concurrent instantiation
     
     def __new__(cls, *args, **kwargs):
         """Implementa patrón singleton opcional."""
@@ -129,8 +128,8 @@ class AntiDetectionDriver:
             self.config.anti_detection_level.value
         )
         
-        # ID único para el perfil - "deepseek_main" asegura persistencia entre reinicios
-        self.profile_id = profile_id or "deepseek_main"
+        # ID único para el perfil
+        self.profile_id = profile_id or f"deepseek_{random.randint(1000, 9999)}"
         
         # Comportamiento humano
         self.human = HumanBehavior()
@@ -160,39 +159,14 @@ class AntiDetectionDriver:
         
         # Crear driver
         try:
-            # Serializar la creación nativa del driver para evitar choques en I/O con undetected-chromedriver
-            with self._init_lock:
-                if HAS_UNDETECTED:
-                    driver = self._create_undetected_driver(options)
-                else:
-                    driver = self._create_standard_driver(options)
+            if HAS_UNDETECTED:
+                driver = self._create_undetected_driver(options)
+            else:
+                driver = self._create_standard_driver(options)
             
             # Configurar timeouts
             driver.set_page_load_timeout(self.config.page_load_timeout)
             driver.implicitly_wait(5)
-            
-            # FIX F5-04: bloquear SOLO trackers/analítica externos.
-            # Bloquear *.jpg/*.png globalmente también cortaba assets de DeepSeek,
-            # lo que es detectable. Las imágenes de la propia app deben cargarse normal.
-            try:
-                driver.execute_cdp_cmd('Network.enable', {})
-                driver.execute_cdp_cmd('Network.setBlockedURLs', {
-                    "urls": [
-                        "*google-analytics.com*",
-                        "*doubleclick.net*",
-                        "*sentry.io*",
-                        "*datadoghq.com*",
-                        "*hotjar.com*",
-                        "*amplitude.com*",
-                        "*segment.io*",
-                        "*mixpanel.com*",
-                        "*fullstory.com*",
-                        "*heap.io*"
-                    ]
-                })
-                self.logger.info("Reglas CDP de bloqueo de trackers aplicadas (sin bloquear assets propios)")
-            except Exception as e:
-                self.logger.warning(f"No se pudo aplicar el bloqueo CDP: {e}")
             
             # Inyectar scripts de fingerprinting
             self._inject_fingerprint_scripts(driver)
@@ -243,9 +217,10 @@ class AntiDetectionDriver:
             '--disable-features=IsolateOrigins,site-per-process',
             '--enable-features=NetworkService,NetworkServiceInProcess',
         ]
+        
         for arg in anti_detection_args:
             options.add_argument(arg)
-            
+        
         # Configurar user agent
         options.add_argument(f'--user-agent={self.profile.user_agent}')
         
@@ -264,14 +239,6 @@ class AntiDetectionDriver:
             options.add_argument('--headless=new')
             options.add_argument('--disable-gpu')
             options.add_argument('--no-sandbox')
-            
-            # Optimizaciones Extremas de Velocidad (Precaching y Headless Profundo)
-            options.add_argument('--blink-settings=imagesEnabled=false')
-            options.add_argument('--disable-remote-fonts')
-            
-            # Asegurar caché en directorio temporal volátil (Zero-Disk-I/O bottleneck)
-            cache_dir = tempfile.mkdtemp(prefix="ds_speedcache_")
-            options.add_argument(f'--disk-cache-dir={cache_dir}')
         
         # Preferencias adicionales
         prefs = {
@@ -291,16 +258,8 @@ class AntiDetectionDriver:
         # Directorio de perfil de usuario (para persistir cookies)
         profile_dir = os.path.join(self.config.profile_dir, self.profile_id)
         os.makedirs(profile_dir, exist_ok=True)
-        self._clean_profile_cache(profile_dir)  # <-- Limpieza profunda de almacenamiento inútil
         options.add_argument(f'--user-data-dir={profile_dir}')
-
-        # Configurar proxy si existe
-        if self.config.proxy:
-            self.logger.info(f"Configurando proxy: {self.config.proxy}")
-            options.add_argument(f'--proxy-server={self.config.proxy}')
-            options.add_argument('--ignore-certificate-errors')
-            options.add_argument('--allow-running-insecure-content')
-
+        
         return options
     
     def _create_undetected_driver(self, options: Options):
@@ -316,7 +275,6 @@ class AntiDetectionDriver:
         self.logger.info("Usando undetected-chromedriver")
         
         # Configuración específica de undetected
-        # version_main=145 debe coincidir con el Chrome instalado (145.0.7632.x)
         driver = uc.Chrome(
             options=options,
             use_subprocess=True,  # Usar subproceso para mejor conexión en Windows
@@ -329,7 +287,6 @@ class AntiDetectionDriver:
     def _create_standard_driver(self, options: Options):
         """
         Crea un driver estándar de Selenium como fallback.
-        BUG FIX: inyecta el script completo, no solo webdriver_script.
         
         Args:
             options: Opciones de Chrome
@@ -349,36 +306,34 @@ class AntiDetectionDriver:
             # Fallback a Chrome directo
             driver = webdriver.Chrome(options=options)
         
-        # BUG FIX: inyectar script completo, no solo webdriver_script
+        # Ejecutar script CDP para anti-detección adicional
         driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': self.fingerprint_gen.generate_all_scripts()
+            'source': self.fingerprint_gen.generate_webdriver_script()
         })
         
         return driver
     
     def _inject_fingerprint_scripts(self, driver):
         """
-        Inyecta los scripts de fingerprinting en el driver via CDP.
-        Page.addScriptToEvaluateOnNewDocument persiste en todas las
-        navegaciones futuras automáticamente.
+        Inyecta los scripts de fingerprinting en el driver.
         
         Args:
             driver: WebDriver destino
         """
         self.logger.info("Inyectando scripts de fingerprinting...")
         
+        # Script completo
         script = self.fingerprint_gen.generate_all_scripts()
         
+        # Inyectar en todas las páginas nuevas
         try:
             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': script
             })
-            self.logger.info(
-                f"Scripts inyectados. Seed: {self.fingerprint_gen.get_seed()}, "
-                f"Hash: {self.fingerprint_gen.get_script_hash()[:8]}"
-            )
+            self.logger.info("Scripts de fingerprinting inyectados")
         except Exception as e:
-            self.logger.warning(f"Error inyectando via CDP: {e}, ejecutando directamente")
+            self.logger.warning(f"Error inyectando via CDP: {e}")
+            # Fallback: ejecutar directamente
             driver.execute_script(script)
     
     @property
@@ -396,29 +351,32 @@ class AntiDetectionDriver:
         """
         self.logger.info(f"Navegando a: {url}")
         
+        # Delay antes de navegar
+        delay = get_action_delay('navigate')
+        time.sleep(delay / 1000)
+        
+        # Navegar
         self._driver.get(url)
         self._current_url = url
         
+        # Esperar a que cargue
         if wait_time:
             time.sleep(wait_time)
         
-        # Re-ejecutar fingerprint en la página actual (cubre SPAs con pushState)
-        try:
-            self._driver.execute_script(self.fingerprint_gen.generate_all_scripts())
-        except Exception:
-            pass
-
+        # Simular comportamiento humano post-navegación
         self._post_navigation_behavior()
     
     def _post_navigation_behavior(self):
         """Simula comportamiento humano después de navegar."""
+        # Movimiento de ratón aleatorio
         if self.human.should_move_randomly():
             try:
                 self.random_mouse_move()
             except Exception:
                 pass
         
-        time.sleep(random.uniform(0.2, 0.4))
+        # Pequeña pausa
+        time.sleep(random.uniform(0.5, 1.5))
     
     def random_mouse_move(self):
         """Realiza un movimiento de ratón aleatorio."""
@@ -426,9 +384,11 @@ class AntiDetectionDriver:
         if not viewport:
             return
         
+        # Posición actual (simulada, centro)
         current_x = viewport['width'] // 2
         current_y = viewport['height'] // 2
         
+        # Movimiento aleatorio
         movement = self.human.generate_random_mouse_movement(
             current_x, current_y,
             max_distance=min(200, viewport['width'] // 4)
@@ -436,16 +396,22 @@ class AntiDetectionDriver:
         
         if movement:
             target_x, target_y = movement
+            # Asegurar que está dentro del viewport
             target_x = max(0, min(viewport['width'], target_x))
             target_y = max(0, min(viewport['height'], target_y))
+            
             self.human_move_to(target_x, target_y)
     
     def _get_viewport_size(self) -> Optional[Dict[str, int]]:
         """Obtiene el tamaño del viewport."""
         try:
-            return self._driver.execute_script("""
-                return { width: window.innerWidth, height: window.innerHeight };
+            result = self._driver.execute_script("""
+                return {
+                    width: window.innerWidth,
+                    height: window.innerHeight
+                };
             """)
+            return result
         except Exception:
             return None
     
@@ -460,7 +426,9 @@ class AntiDetectionDriver:
             speed: 'normal' (Bezier) o 'fast' (Instantáneo con jitter)
         """
         from selenium.webdriver.common.action_chains import ActionChains
+        from selenium.webdriver.common.actions.mouse_button import MouseButton
         
+        # Obtener posición actual del ratón (aproximada)
         try:
             current_pos = self._driver.execute_script("""
                 return window.__lastMousePos || {x: window.innerWidth/2, y: window.innerHeight/2};
@@ -471,39 +439,48 @@ class AntiDetectionDriver:
         actions = ActionChains(self._driver)
 
         if speed == 'fast':
+            # Movimiento instantáneo con desplazamiento relativo único
             offset_x = x - current_pos['x']
             offset_y = y - current_pos['y']
             try:
                 actions.move_by_offset(offset_x, offset_y).perform()
             except Exception:
-                self._driver.execute_script(f"window.__lastMousePos = {{x: {x}, y: {y}}};")
+                # Fallback JS si falla el offset
+                self.execute_script(f"window.__lastMousePos = {{x: {x}, y: {y}}};")
         else:
+            # Generar trayectoria
             path = self.human.mouse.generate_path(
-                current_pos['x'], current_pos['y'], x, y
+                current_pos['x'], current_pos['y'],
+                x, y
             )
             
-            # BUG FIX: usar enumerate en lugar de path.index() para evitar
-            # offset incorrecto cuando hay puntos duplicados en la trayectoria.
-            prev_x, prev_y = current_pos['x'], current_pos['y']
-            try:
-                window_size = self._driver.get_window_size()
-                max_w, max_h = window_size['width'], window_size['height']
-            except Exception:
-                max_w, max_h = self.profile.screen_width, self.profile.screen_height
-
-            for i, (px, py) in enumerate(path):
+            # Ejecutar movimiento
+            
+            for px, py in path:
                 try:
+                    # Obtener tamaño actual de la ventana por seguridad
+                    window_size = self._driver.get_window_size()
+                    max_w, max_h = window_size['width'], window_size['height']
+                    
+                    # Validar que el punto esté dentro de límites razonables (viewport)
                     if px < 0 or py < 0 or px >= max_w or py >= max_h:
                         self.logger.debug(f"Punto fuera de límites omitido: ({px}, {py})")
-                        prev_x, prev_y = px, py
                         continue
 
-                    offset_x = px - prev_x
-                    offset_y = py - prev_y
-                    prev_x, prev_y = px, py
-
+                    # Usar move_by_offset para movimientos relativos
+                    if path.index((px, py)) == 0:
+                        # Primer movimiento desde posición actual
+                        offset_x = px - current_pos['x']
+                        offset_y = py - current_pos['y']
+                    else:
+                        # Movimientos relativos al punto anterior
+                        prev_x, prev_y = path[path.index((px, py)) - 1]
+                        offset_x = px - prev_x
+                        offset_y = py - prev_y
+                    
                     actions.move_by_offset(offset_x, offset_y)
                     actions.pause(0.001)
+                    
                 except Exception as e:
                     self.logger.debug(f"Error en paso de trayectoria: {e}")
                     continue
@@ -511,86 +488,67 @@ class AntiDetectionDriver:
             try:
                 actions.perform()
             except Exception as e:
-                self.logger.debug(f"ActionChains perform falló: {e}")
-                self._driver.execute_script(f"window.__lastMousePos = {{x: {x}, y: {y}}};")
+                self.logger.debug(f"ActionChains perform omitido por límites o error: {e}")
+                # Si ActionChains falla, al menos intentamos mover instantáneamente por JS
+                self.execute_script(f"window.__lastMousePos = {{x: {x}, y: {y}}};")
         
+        # Guardar posición actual
         try:
-            self._driver.execute_script(f"window.__lastMousePos = {{x: {x}, y: {y}}};")
+            self._driver.execute_script(f"""
+                window.__lastMousePos = {{x: {x}, y: {y}}};
+            """)
         except Exception:
             pass
     
     def human_click(self, element, move_to: bool = True, speed: str = 'normal'):
+        """
+        Realiza un clic de forma humana.
+        
+        Args:
+            element: Elemento a clickear
+            move_to: Si mover el ratón primero
+            speed: 'normal' o 'fast'
+        """
         try:
-            self._driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+            if move_to:
+                # Asegurar visibilidad
+                location = element.location_once_scrolled_into_view
+                size = element.size
+                
+                # Centro con jitter mínimo
+                target_x = location['x'] + size['width'] // 2 + random.randint(-2, 2)
+                target_y = location['y'] + size['height'] // 2 + random.randint(-2, 2)
+                
+                self.human_move_to(target_x, target_y, speed=speed)
+            
+            # Pequeña pausa antes del clic
             time.sleep(random.uniform(0.1, 0.3))
             
-            # Click via ActionChains sobre el elemento directo, sin coordenadas
+            # Realizar clic usando ActionChains para que sea 'humano'
             from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(self._driver)\
-                .move_to_element(element)\
-                .pause(random.uniform(0.05, 0.15))\
-                .click()\
-                .perform()
-                
+            actions = ActionChains(self._driver)
+            actions.click()
+            actions.perform()
+            
         except Exception as e:
-            self.logger.debug(f"human_click fallback JS: {e}")
-            self._driver.execute_script("arguments[0].click();", element)
+            self.logger.debug(f"human_click: Simulación humana falló ({e}), usando fallbacks...")
+            try:
+                # Fallback: Scrollear al elemento por JS y clickear directamente
+                self.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+                time.sleep(0.5)
+                element.click()
+            except Exception as e2:
+                self.logger.error(f"Fallo crítico en clic: {e2}")
+                # Último recurso: clic por JS
+                self.execute_script("arguments[0].click();", element)
         
+        # Pausa post-clic basada en perfil humano
         time.sleep(get_action_delay('click') / 1000)
     
-    # Umbral: mensajes más largos que esto se inyectan vía JS (instantáneo)
-    FAST_TYPE_THRESHOLD = 100
-
-    def _inject_text_js(self, element, text: str) -> bool:
-        """
-        Inyecta texto en un elemento React usando el setter nativo del InputEvent.
-        Engaña al framework para que registre el cambio en su estado interno.
-        Retorna True si tuvo éxito, False si falla (fallback a send_keys).
-        """
-        try:
-            # Escape de caracteres especiales para JSON seguro en JS
-            escaped = text.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
-            js = f"""
-(function(el, text) {{
-    // Obtener el setter nativo de HTMLTextAreaElement (bypassea React)
-    var nativeInput = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype, 'value'
-    );
-    if (!nativeInput) {{
-        // Fallback para <div contenteditable>
-        nativeInput = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-        );
-    }}
-    if (nativeInput && nativeInput.set) {{
-        nativeInput.set.call(el, text);
-        // Disparar eventos que React escucha para actualizar su estado
-        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        return true;
-    }}
-    return false;
-}})(arguments[0], `{escaped}`);
-"""
-            result = self._driver.execute_script(js, element)
-            if result:
-                self.logger.debug(f"JS inject OK ({len(text)} chars)")
-                return True
-            self.logger.debug("JS inject: nativeInput no disponible, fallback")
-            return False
-        except Exception as e:
-            self.logger.debug(f"JS inject error: {e}")
-            return False
-
     def human_type(self, element, text: str, clear_first: bool = True):
         """
-        Escribe texto en un elemento web.
-
-        - Mensajes cortos (≤ FAST_TYPE_THRESHOLD chars): escritura humana simulada
-          con delays aleatorios para parecer natural.
-        - Mensajes largos (> FAST_TYPE_THRESHOLD chars): inyección JS instantánea
-          via nativeInputValueSetter (React-compatible, prácticamente indetectable).
-
+        Escribe texto de forma humana.
+        
         Args:
             element: Elemento donde escribir
             text: Texto a escribir
@@ -598,28 +556,21 @@ class AntiDetectionDriver:
         """
         from selenium.webdriver.common.action_chains import ActionChains
         from selenium.webdriver.common.keys import Keys
-
+        
+        # Clic en el elemento
         self.human_click(element)
-
+        
         if clear_first:
+            # Seleccionar todo y borrar
             ActionChains(self._driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
             time.sleep(random.uniform(0.1, 0.2))
             element.send_keys(Keys.BACKSPACE)
-            time.sleep(random.uniform(0.05, 0.15))
-
-        if len(text) > self.FAST_TYPE_THRESHOLD:
-            # === MODO RÁPIDO: JS injection para textos largos ===
-            self.logger.debug(f"Usando JS injection para texto largo ({len(text)} chars)")
-            success = self._inject_text_js(element, text)
-            if success:
-                # Pausa breve post-inyección para que React procese el estado
-                time.sleep(random.uniform(0.15, 0.3))
-                return
-            # Si falla el JS, caemos al modo humano (fallback)
-            self.logger.warning("JS injection falló, usando escritura carácter a carácter")
-
-        # === MODO HUMANO: escritura carácter a carácter para textos cortos ===
+            time.sleep(random.uniform(0.1, 0.3))
+        
+        # Generar secuencia de escritura
         sequence = self.human.typing.generate_typing_sequence(text)
+        
+        # Ejecutar escritura
         for char, delay in sequence:
             if char == '[PAUSE]':
                 time.sleep(delay / 1000)
@@ -629,7 +580,6 @@ class AntiDetectionDriver:
             else:
                 element.send_keys(char)
                 time.sleep(delay / 1000)
-
     
     def human_scroll(self, distance: int, direction: str = 'down'):
         """
@@ -640,37 +590,84 @@ class AntiDetectionDriver:
             direction: 'up' o 'down'
         """
         steps = self.human.scroll.generate_scroll_steps(distance, direction)
+        
         for amount, delay in steps:
-            self._driver.execute_script(f"window.scrollBy(0, {amount});")
+            script = f"window.scrollBy(0, {amount});"
+            self._driver.execute_script(script)
             time.sleep(delay / 1000)
     
-    def wait_for_element(self, locator: tuple, timeout: float = None, condition: str = 'visible'):
-        """Espera a que un elemento esté disponible."""
+    def wait_for_element(
+        self,
+        locator: tuple,
+        timeout: float = None,
+        condition: str = 'visible'
+    ):
+        """
+        Espera a que un elemento esté disponible.
+        
+        Args:
+            locator: Tupla (By, selector)
+            timeout: Timeout en segundos
+            condition: 'visible', 'clickable', 'present'
+        
+        Returns:
+            WebElement: Elemento encontrado
+        
+        Raises:
+            TimeoutException: Si no se encuentra el elemento
+        """
         timeout = timeout or self.config.element_wait_timeout
+        
         conditions = {
             'visible': EC.visibility_of_element_located,
             'clickable': EC.element_to_be_clickable,
             'present': EC.presence_of_element_located,
         }
+        
         wait_condition = conditions.get(condition, EC.visibility_of_element_located)
+        
         return WebDriverWait(self._driver, timeout).until(wait_condition(locator))
     
     def wait_for_text(self, locator: tuple, text: str, timeout: float = None):
-        """Espera a que aparezca cierto texto en un elemento."""
+        """
+        Espera a que aparezca cierto texto en un elemento.
+        
+        Args:
+            locator: Tupla (By, selector)
+            text: Texto a esperar
+            timeout: Timeout en segundos
+        """
         timeout = timeout or self.config.element_wait_timeout
         return WebDriverWait(self._driver, timeout).until(
             EC.text_to_be_present_in_element(locator, text)
         )
     
     def find_element_safe(self, locator: tuple, timeout: float = 5):
-        """Busca un elemento de forma segura, devuelve None si no lo encuentra."""
+        """
+        Busca un elemento de forma segura.
+        
+        Args:
+            locator: Tupla (By, selector)
+            timeout: Timeout en segundos
+        
+        Returns:
+            WebElement o None
+        """
         try:
             return self.wait_for_element(locator, timeout)
         except TimeoutException:
             return None
     
     def is_element_present(self, locator: tuple) -> bool:
-        """Verifica si un elemento está presente."""
+        """
+        Verifica si un elemento está presente.
+        
+        Args:
+            locator: Tupla (By, selector)
+        
+        Returns:
+            bool: True si está presente
+        """
         try:
             self._driver.find_element(*locator)
             return True
@@ -678,25 +675,42 @@ class AntiDetectionDriver:
             return False
     
     def execute_script(self, script: str, *args):
-        """Ejecuta JavaScript en la página."""
-        if not self._driver:
-            return None
+        """
+        Ejecuta JavaScript en la página.
+        
+        Args:
+            script: Código JavaScript
+            *args: Argumentos para el script
+        
+        Returns:
+            Resultado del script
+        """
         return self._driver.execute_script(script, *args)
     
     def get_screenshot(self, filename: str = None) -> str:
-        """Toma una captura de pantalla."""
+        """
+        Toma una captura de pantalla.
+        
+        Args:
+            filename: Nombre del archivo (opcional)
+        
+        Returns:
+            str: Ruta del archivo
+        """
         if filename is None:
             timestamp = int(time.time())
             filename = f"screenshot_{timestamp}.png"
+        
         filepath = os.path.join(self.config.screenshot_dir, filename)
         os.makedirs(self.config.screenshot_dir, exist_ok=True)
+        
         self._driver.save_screenshot(filepath)
         return filepath
     
     def get_page_source(self) -> str:
         """Devuelve el código fuente de la página actual."""
         return self._driver.page_source
-
+    
     def get_current_url(self) -> str:
         """Devuelve la URL actual."""
         return self._driver.current_url
@@ -712,11 +726,6 @@ class AntiDetectionDriver:
     def refresh(self):
         """Refresca la página actual."""
         self._driver.refresh()
-        # Re-ejecutar fingerprint tras refresh (SPA safety)
-        try:
-            self._driver.execute_script(self.fingerprint_gen.generate_all_scripts())
-        except Exception:
-            pass
         self._post_navigation_behavior()
     
     def go_back(self):
@@ -725,7 +734,7 @@ class AntiDetectionDriver:
         self._post_navigation_behavior()
     
     def close(self):
-        """Cierra el driver y realiza una limpieza post-mortem."""
+        """Cierra el driver."""
         if self._driver:
             try:
                 self._driver.quit()
@@ -734,56 +743,16 @@ class AntiDetectionDriver:
             finally:
                 self._driver = None
                 self._is_initialized = False
-                # Intentar limpiar la caché si es posible luego de cerrar
-                profile_dir = os.path.join(self.config.profile_dir, self.profile_id)
-                self._clean_profile_cache(profile_dir)
     
     def quit(self):
-        """Alias para close()."""
+        """Alias para close() para compatibilidad con Selenium API."""
         self.close()
-        
-    def _clean_profile_cache(self, profile_dir: str):
-        """
-        Limpia carpetas basura de Chrome que inflan el disco, conservando
-        únicamente la persistencia de cookies de inicio de sesión.
-        """
-        import shutil
-        import stat
-        
-        # Targets conocidos por su enorme consumo de espacio y poco valor transaccional
-        cache_targets = [
-            "Default/Cache",
-            "Default/Code Cache",
-            "Default/Service Worker",
-            "Default/GPUCache",
-            "Default/DawnCache",
-            "GrShaderCache",
-            "ShaderCache",
-            "Crashpad",
-            "GraphiteDawnCache"
-        ]
-        
-        # Función recursiva para forzar borrado saltando permisos de "solo lectura" en Windows
-        def on_rm_error(func, path, exc_info):
-            try:
-                os.chmod(path, stat.S_IWRITE)
-                func(path)
-            except Exception:
-                pass
-
-        for target in cache_targets:
-            target_path = os.path.join(profile_dir, os.path.normpath(target))
-            if os.path.exists(target_path):
-                try:
-                    shutil.rmtree(target_path, onerror=on_rm_error)
-                    self.logger.debug(f"Purgado: {target}")
-                except Exception as e:
-                    self.logger.debug(f"No se pudo limpiar {target}: {e}")
     
     def enable_spy_mode(self):
-        """Inyecta el script de espionaje para monitorear el DOM."""
+        """Inyecta el script de espionaje para monitorear el DOM y coordenadas."""
         base_dir = os.path.dirname(os.path.abspath(__file__))
         spy_script_path = os.path.join(base_dir, 'resources', 'spy_mode.js')
+        
         if os.path.exists(spy_script_path):
             with open(spy_script_path, 'r', encoding='utf-8') as f:
                 script_content = f.read()
@@ -793,7 +762,7 @@ class AntiDetectionDriver:
             self.logger.error(f"[Spy Mode] Script no encontrado en {spy_script_path}")
 
     def take_observation_screenshot(self, name=None):
-        """Toma una captura y la guarda en captures/."""
+        """Toma una captura de pantalla y la guarda en la carpeta de capturas."""
         if not self._driver:
             return None
         os.makedirs("captures", exist_ok=True)
@@ -808,6 +777,12 @@ class AntiDetectionDriver:
         if not self._driver:
             return []
         return self._driver.get_log(log_type)
+
+    def execute_script(self, script, *args):
+        """Ejecuta JavaScript."""
+        if not self._driver:
+            return None
+        return self._driver.execute_script(script, *args)
 
     @property
     def page_source(self):
@@ -824,12 +799,16 @@ class AntiDetectionDriver:
         return self._driver.current_url
     
     def __enter__(self):
+        """Context manager entry."""
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
         self.close()
     
     def __del__(self):
+        """Destructor."""
+        # No cerrar automáticamente si es singleton
         if not hasattr(self, '_driver') or AntiDetectionDriver._instance != self:
             self.close()
 

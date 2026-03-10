@@ -171,142 +171,11 @@ def list_models():
 @app.route('/v1/models/<model_id>', methods=['GET'])
 def get_model(model_id: str):
     """Obtiene información de un modelo específico."""
-    # Aceptar cualquier modelo (Claude, DeepSeek, etc.)
+    if model_id not in ["deepseek-chat", "deepseek-reasoner"]:
+        return jsonify({"error": f"Modelo no encontrado: {model_id}"}), 404
+    
     model = ModelInfo(id=model_id)
     return jsonify(asdict(model))
-
-
-@app.route('/v1/responses', methods=['POST'])
-def openai_responses():
-    """
-    Endpoint OpenAI Responses API (/v1/responses).
-    LiteLLM lo llama cuando Claude Code envía peticiones Anthropic con beta=true.
-    """
-    if driver_pool is None:
-        return jsonify({"error": "Driver pool no inicializado"}), 503
-
-    try:
-        data = request.get_json() or {}
-        model = data.get('model', 'deepseek-chat')
-
-        # === DEBUG: loguear qué recibimos para entender el formato de LiteLLM ===
-        logger.info(f"[/v1/responses] Keys recibidos: {list(data.keys())}")
-        logger.info(f"[/v1/responses] Payload completo: {json.dumps(data, ensure_ascii=False)[:500]}")
-        # ========================================================================
-
-        # Aceptar múltiples formatos que LiteLLM puede enviar
-        user_message = None
-
-        # 1) Campo 'input' estándar de Responses API
-        if 'input' in data:
-            raw = data['input']
-            if isinstance(raw, str) and raw.strip():
-                user_message = raw
-            elif isinstance(raw, list):
-                parts = []
-                for item in raw:
-                    if isinstance(item, dict):
-                        role = item.get('role', 'user')
-                        content = item.get('content', '')
-                        if isinstance(content, list):
-                            content = ' '.join(
-                                c.get('text', '') for c in content
-                                if isinstance(c, dict) and c.get('type') == 'text'
-                            )
-                        if role in ('user', 'human'):
-                            parts.append(str(content))
-                        elif role == 'assistant':
-                            parts.append(f"[Asistente]: {content}")
-                        elif role == 'system':
-                            parts.append(f"[Sistema]: {content}")
-                    elif isinstance(item, str):
-                        parts.append(item)
-                user_message = '\n'.join(parts) if parts else None
-
-        # 2) Campo 'messages' estándar de Chat Completions API
-        if user_message is None and 'messages' in data:
-            msgs = data['messages']
-            parts = []
-            for m in msgs:
-                role = m.get('role', 'user')
-                content = m.get('content', '')
-                if isinstance(content, list):
-                    content = ' '.join(c.get('text', '') for c in content if isinstance(c, dict))
-                if role == 'system':
-                    parts.append(f"[Sistema]: {content}")
-                elif role == 'assistant':
-                    parts.append(f"[Asistente]: {content}")
-                else:
-                    parts.append(str(content))
-            if parts:
-                user_message = '\n'.join(parts)
-
-        # 3) Campo 'prompt'
-        if user_message is None and 'prompt' in data:
-            user_message = str(data['prompt'])
-
-        # 4) Buscar cualquier campo string no vacío como fallback
-        if user_message is None:
-            for k, v in data.items():
-                if k not in ('model', 'stream', 'max_tokens', 'temperature', 'top_p') and isinstance(v, str) and v.strip():
-                    logger.warning(f"[/v1/responses] Usando campo fallback '{k}' como input")
-                    user_message = v
-                    break
-
-        if not user_message:
-            logger.error(f"[/v1/responses] No se encontró input. Keys: {list(data.keys())}")
-            # Devolver un mensaje de diagnóstico útil
-            return jsonify({
-                "error": f"No se encontró input. Keys disponibles: {list(data.keys())}"
-            }), 400
-
-        logger.info(f"[/v1/responses] model={model}, msg_len={len(user_message)}")
-
-        with driver_pool.get_driver() as driver:
-            client = _build_client(driver)
-            response = client.ask(user_message)
-
-        if response.is_error:
-            return jsonify({"error": response.metadata.get("error", "Error desconocido")}), 500
-
-        content_text = response.content
-        response_id = f"resp_{uuid.uuid4().hex[:24]}"
-        return jsonify({
-            "id": response_id,
-            "object": "response",
-            "created_at": int(time.time()),
-            "model": model,
-            "status": "completed",
-            "output": [{
-                "type": "message",
-                "id": f"msg_{uuid.uuid4().hex[:24]}",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": content_text,
-                    "annotations": []
-                }],
-                "status": "completed"
-            }],
-            "usage": {
-                "input_tokens": len(user_message) // 4,
-                "output_tokens": len(content_text) // 4,
-                "total_tokens": (len(user_message) + len(content_text)) // 4
-            },
-            "error": None,
-            "incomplete_details": None,
-            "instructions": None,
-            "metadata": {},
-            "parallel_tool_calls": True,
-            "temperature": 1.0,
-            "tool_choice": "auto",
-            "tools": [],
-            "top_p": 1.0
-        })
-
-    except Exception as e:
-        logger.error(f"[/v1/responses] Excepcion: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/v1/chat/completions', methods=['POST'])
@@ -328,34 +197,18 @@ def chat_completions():
         model = data.get('model', 'deepseek-chat')
         stream = data.get('stream', False)
 
-        # FIX F4-01: construir el prompt completo con todo el historial de mensajes.
-        # El cliente Selenium mantiene la sesión del browser, pero el contexto
-        # previo del chat solo existe en el browser si la conversación sigue abierta.
-        # Para llamadas multi-turno desde la API, concatenamos el historial completo
-        # en un único mensaje formateado que DeepSeek pueda procesar.
-        parts = []
+        # FIX #3: conversation_history era construido pero nunca usado por el cliente.
+        # El contexto de conversación lo mantiene el browser en la sesión de Selenium.
+        # Solo necesitamos el último mensaje de usuario.
+        user_message = None
         for msg in messages:
-            role = msg.get('role', 'user')
-            content = msg.get('content', '')
-            if not content:
-                continue
-            if role == 'system':
-                parts.append(f"[Instrucción de sistema]: {content}")
-            elif role == 'assistant':
-                parts.append(f"[Asistente]: {content}")
-            elif role == 'user':
-                parts.append(f"[Usuario]: {content}")
-
-        # Si solo hay un mensaje de usuario, enviarlo directamente sin prefijos
-        if len([m for m in messages if m.get('role') == 'user']) == 1 and len(parts) == 1:
-            user_message = messages[-1].get('content', '')
-        else:
-            user_message = "\n\n".join(parts)
+            if msg.get('role') == 'user':
+                user_message = msg.get('content', '')
 
         if not user_message:
             return jsonify({"error": "No se encontró mensaje de usuario"}), 400
 
-        logger.info(f"Recibida solicitud: model={model}, stream={stream}, msg_len={len(user_message)}, turns={len(messages)}")
+        logger.info(f"Recibida solicitud: model={model}, stream={stream}, msg_len={len(user_message)}")
 
         if stream:
             return stream_response(user_message, model)
@@ -369,47 +222,27 @@ def chat_completions():
 
 def _build_client(driver) -> DeepSeekClient:
     """
-    Construye un DeepSeekClient válido reutilizando un driver del pool.
-    Navega a DeepSeek si es necesario e inyecta el interceptor de red.
+    FIX #2: construye un DeepSeekClient válido reutilizando un driver del pool.
+    __new__ bypasea __init__, por lo que hay que inicializar todos los atributos
+    que _ask_impl() necesita para no lanzar AttributeError.
     """
     client = DeepSeekClient.__new__(DeepSeekClient)
     client.driver = driver
     client.config = config
     client.logger = logger
     client.history = HistoryManager(config.history_dir)
+    client._is_logged_in = True          # el driver del pool ya tiene sesión activa
     client._current_model = DeepSeekModel.DEEPSEEK_CHAT
     client._last_response = None
     client._conversation_started = False
-    client._interaction_count = 0
     client.api_headers = {
         "x-app-version": "20241129.1",
         "x-client-version": "1.7.0",
         "x-client-platform": "web"
     }
-
-    # Inicializar TokenManager (necesario para _handle_token_alert)
-    from deepseek_client.token_manager import TokenManager
-    client.token_manager = TokenManager(
-        driver=driver.driver,
-        logger=logger,
-        alert_callback=lambda msg: logger.critical(msg)
-    )
-
-    # Navegar a DeepSeek si no estamos ya ahí
-    try:
-        current_url = driver.driver.current_url
-        if "deepseek.com" not in current_url:
-            logger.info(f"Driver en '{current_url}', navegando a DeepSeek...")
-            client._navigate_to_deepseek()
-        else:
-            logger.info("Driver ya está en DeepSeek, reutilizando sesión.")
-            # Asegurar que el interceptor de red esté inyectado
-            client._inject_network_interceptor()
-    except Exception as e:
-        logger.warning(f"Error verificando URL del driver, navegando de nuevo: {e}")
-        client._navigate_to_deepseek()
-
-    client._is_logged_in = True
+    client.saved_user_token = None
+    client.saved_waf_token = None
+    client.saved_smid_v2 = None
     return client
 
 

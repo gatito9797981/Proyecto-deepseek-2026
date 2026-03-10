@@ -302,171 +302,6 @@ class MouseMovement:
         return result
 
 
-class PseudoNoise:
-    """
-    Generador de Ruido 1D Continuo y Suave (estilo Perlin/Simplex).
-    Sirve para inyectar micro-temblores orgánicos (biológicos) al ratón
-    sin depender de bibliotecas externas pesadas.
-    """
-    def __init__(self, octaves=3, persistency=0.5, scale=1.0):
-        self.octaves = octaves
-        self.persistency = persistency
-        self.scale = scale
-        # Generamos fases aleatorias para que cada movimiento sea distinto
-        self.phases = [random.uniform(0, 2 * math.pi) for _ in range(octaves)]
-        
-    def noise(self, t: float) -> float:
-        """Devuelve un valor de ruido suave entre -1 y 1 para el tiempo t."""
-        total = 0.0
-        frequency = self.scale
-        amplitude = 1.0
-        max_val = 0.0
-        
-        for i in range(self.octaves):
-            total += math.sin(t * frequency + self.phases[i]) * amplitude
-            max_val += amplitude
-            amplitude *= self.persistency
-            frequency *= 2.0
-            
-        return total / max_val
-
-
-class AIMouseMovement(MouseMovement):
-    """
-    Simulador de movimiento de ratón basado en comportamientos biométricos.
-    Evade sistemas antibot inyectando Temblores Orgánicos (Perlin Noise), 
-    Física de Overshoot (pasar el objetivo y volver) y Velocidad Estocástica.
-    """
-    
-    def __init__(
-        self,
-        base_speed: float = 800.0,
-        randomness: float = 0.4
-    ):
-        super().__init__(base_speed, 1.5, randomness)
-        self.noise_generator = PseudoNoise(octaves=3, persistency=0.4, scale=10.0)
-
-    def calculate_duration(self, distance: float) -> float:
-        if distance < 10:
-            return random.uniform(0.08, 0.15)
-        elif distance < 100:
-            return random.uniform(0.15, 0.35)
-        elif distance < 500:
-            return random.uniform(0.35, 0.65)
-        else:
-            return distance / (self.base_speed * random.uniform(0.7, 1.1))
-
-    def generate_path(
-        self,
-        start_x: float,
-        start_y: float,
-        end_x: float,
-        end_y: float,
-        num_points: Optional[int] = None
-    ) -> List[Tuple[float, float]]:
-        start = Point(start_x, start_y)
-        end = Point(end_x, end_y)
-        distance = start.distance_to(end)
-        
-        if num_points is None:
-            duration = self.calculate_duration(distance)
-            num_points = max(5, int(duration * 60))
-            
-        # 1. Analizar Overshoot (Solo para distancias medias/largas)
-        overshoot_target = end
-        has_overshoot = False
-        if distance > 150 and random.random() < (0.6 * self.randomness):
-            has_overshoot = True
-            # Nos pasamos del objetivo un poco (hasta 15px en la dirección del movimiento)
-            delta = end - start
-            norm_x = delta.x / distance
-            norm_y = delta.y / distance
-            overshoot_dist = random.uniform(5, 25) * self.randomness
-            overshoot_target = Point(end.x + norm_x * overshoot_dist, end.y + norm_y * overshoot_dist)
-            
-            # El trayecto hacia el overshoot tomará el 80% de los puntos
-            overshoot_points = int(num_points * 0.8)
-            correction_points = num_points - overshoot_points
-        else:
-            overshoot_points = num_points
-            correction_points = 0
-
-        # Refrescar el ruido por cada nueva trayectoria
-        self.noise_generator = PseudoNoise(octaves=3, scale=random.uniform(5.0, 15.0))
-        
-        # 2. Generar Curva Base usando Bezier hacia el Target (o Overshoot Target)
-        base_curve = BezierCurve.generate_curve(start, overshoot_target, overshoot_points, self.randomness)
-        
-        raw_points = []
-        for i, bp in enumerate(base_curve):
-            t = i / max(1, overshoot_points - 1)
-            # 3. Aplicar Ruido (Temblores) - El temblor es más débil a los extremos para acertar
-            tremor_intensity = math.sin(t * math.pi) * 3.0 * self.randomness
-            
-            # Ruido X e Y usando diferentes fases de tiempo
-            n_x = self.noise_generator.noise(t) * tremor_intensity
-            n_y = self.noise_generator.noise(t + 100.0) * tremor_intensity
-            
-            raw_points.append((bp.x + n_x, bp.y + n_y))
-            
-        # 4. Fase de Corrección (si hubo Overshoot, volver lento al objetivo real)
-        if has_overshoot and correction_points > 0:
-            correction_curve = BezierCurve.generate_curve(
-                Point(raw_points[-1][0], raw_points[-1][1]), 
-                end, 
-                correction_points, 
-                self.randomness * 0.5  # Corrección más precisa
-            )
-            for cp in correction_curve[1:]:
-                raw_points.append((cp.x, cp.y))
-                
-        # Asegurar que el último punto sea exactamente el final para dar en el blanco
-        if distance > 0:
-            raw_points[-1] = (end.x, end.y)
-            
-        return raw_points
-
-    def generate_timed_path(
-        self,
-        start_x: float,
-        start_y: float,
-        end_x: float,
-        end_y: float
-    ) -> List[Tuple[float, float, float]]:
-        
-        path = self.generate_path(start_x, start_y, end_x, end_y)
-        num_points = len(path)
-        if num_points == 0:
-            return []
-            
-        distance = Point(start_x, start_y).distance_to(Point(end_x, end_y))
-        duration = self.calculate_duration(distance)
-        
-        result = []
-        # Perfil de velocidad: Más realista (Log-Normal inverso o Asimétrico)
-        # Humor: Acelera rápido, mantiene el top speed, luego frena prolongadamente
-        for i, (px, py) in enumerate(path):
-            t = i / max(1, num_points - 1)
-            
-            # Curva Beta asimétrica para velocidad (concentra rapidez al inicio-medio)
-            # Alpha = 2, Beta = 5 (aproximación)
-            beta_dist = (t ** 1) * ((1 - t) ** 4) * 20
-            speed_factor = max(0.1, beta_dist)
-            
-            base_delay = duration / num_points * 1000
-            
-            # Micros-pausas orgánicas
-            if random.random() < 0.05:
-                # Fricción del usuario o dudando 10-25ms adicionales
-                delay = (base_delay / speed_factor) + random.uniform(10, 25)
-            else:
-                delay = (base_delay / speed_factor) * random.uniform(0.9, 1.1)
-                
-            result.append((px, py, delay))
-            
-        return result
-
-
 class HumanTyping:
     """
     Simulador de escritura humana.
@@ -511,9 +346,9 @@ class HumanTyping:
     
     def __init__(
         self,
-        mean_delay: float = 25.0,  # ms
-        std_delay: float = 10.0,
-        error_rate: float = 0.005,
+        mean_delay: float = 50.0,  # ms
+        std_delay: float = 20.0,
+        error_rate: float = 0.02,
         pause_on_punctuation: float = 0.15,  # probabilidad de pausa
         pause_duration: float = 200.0  # ms
     ):
@@ -817,7 +652,7 @@ class HumanBehavior:
             error_rate: Tasa de errores de escritura
             randomness: Factor de aleatoriedad general
         """
-        self.mouse = AIMouseMovement(
+        self.mouse = MouseMovement(
             base_speed=800 * mouse_speed,
             randomness=randomness
         )

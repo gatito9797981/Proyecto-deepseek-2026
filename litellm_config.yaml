@@ -1,0 +1,52 @@
+model_list:
+  # Mapear cualquier modelo Claude al servidor DeepSeek local
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: http://localhost:8000/v1
+      api_key: dummy
+
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: http://localhost:8000/v1
+      api_key: dummy
+
+  - model_name: claude-3-5-sonnet-20241022
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: http://localhost:8000/v1
+      api_key: dummy
+
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: http://localhost:8000/v1
+      api_key: dummy
+
+  - model_name: claude-3-opus-20240229
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: http://localhost:8000/v1
+      api_key: dummy
+
+  - model_name: claude-3-haiku-20240307
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: http://localhost:8000/v1
+      api_key: dummy
+
+  # Catch-all: cualquier otro modelo Claude
+  - model_name: "*"
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: http://localhost:8000/v1
+      api_key: dummy
+
+litellm_settings:
+  # Tiempo máximo de respuesta: 5 minutos (DeepSeek puede tardar)
+  request_timeout: 300
+  drop_params: true
+  # Desactivar el Responses API experimental (usa /v1/responses en vez de /v1/chat/completions)
+  # Nuestro servidor Flask solo implementa /v1/chat/completions
+  use_responses_api: false

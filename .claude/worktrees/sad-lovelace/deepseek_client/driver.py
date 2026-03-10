@@ -85,7 +85,6 @@ class AntiDetectionDriver:
     
     _instance: Optional['AntiDetectionDriver'] = None
     _driver = None
-    _init_lock = __import__('threading').Lock()  # Prevent WinError 32 on concurrent instantiation
     
     def __new__(cls, *args, **kwargs):
         """Implementa patrón singleton opcional."""
@@ -160,39 +159,14 @@ class AntiDetectionDriver:
         
         # Crear driver
         try:
-            # Serializar la creación nativa del driver para evitar choques en I/O con undetected-chromedriver
-            with self._init_lock:
-                if HAS_UNDETECTED:
-                    driver = self._create_undetected_driver(options)
-                else:
-                    driver = self._create_standard_driver(options)
+            if HAS_UNDETECTED:
+                driver = self._create_undetected_driver(options)
+            else:
+                driver = self._create_standard_driver(options)
             
             # Configurar timeouts
             driver.set_page_load_timeout(self.config.page_load_timeout)
             driver.implicitly_wait(5)
-            
-            # FIX F5-04: bloquear SOLO trackers/analítica externos.
-            # Bloquear *.jpg/*.png globalmente también cortaba assets de DeepSeek,
-            # lo que es detectable. Las imágenes de la propia app deben cargarse normal.
-            try:
-                driver.execute_cdp_cmd('Network.enable', {})
-                driver.execute_cdp_cmd('Network.setBlockedURLs', {
-                    "urls": [
-                        "*google-analytics.com*",
-                        "*doubleclick.net*",
-                        "*sentry.io*",
-                        "*datadoghq.com*",
-                        "*hotjar.com*",
-                        "*amplitude.com*",
-                        "*segment.io*",
-                        "*mixpanel.com*",
-                        "*fullstory.com*",
-                        "*heap.io*"
-                    ]
-                })
-                self.logger.info("Reglas CDP de bloqueo de trackers aplicadas (sin bloquear assets propios)")
-            except Exception as e:
-                self.logger.warning(f"No se pudo aplicar el bloqueo CDP: {e}")
             
             # Inyectar scripts de fingerprinting
             self._inject_fingerprint_scripts(driver)
@@ -243,9 +217,10 @@ class AntiDetectionDriver:
             '--disable-features=IsolateOrigins,site-per-process',
             '--enable-features=NetworkService,NetworkServiceInProcess',
         ]
+        
         for arg in anti_detection_args:
             options.add_argument(arg)
-            
+        
         # Configurar user agent
         options.add_argument(f'--user-agent={self.profile.user_agent}')
         
@@ -264,14 +239,6 @@ class AntiDetectionDriver:
             options.add_argument('--headless=new')
             options.add_argument('--disable-gpu')
             options.add_argument('--no-sandbox')
-            
-            # Optimizaciones Extremas de Velocidad (Precaching y Headless Profundo)
-            options.add_argument('--blink-settings=imagesEnabled=false')
-            options.add_argument('--disable-remote-fonts')
-            
-            # Asegurar caché en directorio temporal volátil (Zero-Disk-I/O bottleneck)
-            cache_dir = tempfile.mkdtemp(prefix="ds_speedcache_")
-            options.add_argument(f'--disk-cache-dir={cache_dir}')
         
         # Preferencias adicionales
         prefs = {
@@ -291,7 +258,6 @@ class AntiDetectionDriver:
         # Directorio de perfil de usuario (para persistir cookies)
         profile_dir = os.path.join(self.config.profile_dir, self.profile_id)
         os.makedirs(profile_dir, exist_ok=True)
-        self._clean_profile_cache(profile_dir)  # <-- Limpieza profunda de almacenamiento inútil
         options.add_argument(f'--user-data-dir={profile_dir}')
 
         # Configurar proxy si existe
@@ -316,7 +282,6 @@ class AntiDetectionDriver:
         self.logger.info("Usando undetected-chromedriver")
         
         # Configuración específica de undetected
-        # version_main=145 debe coincidir con el Chrome instalado (145.0.7632.x)
         driver = uc.Chrome(
             options=options,
             use_subprocess=True,  # Usar subproceso para mejor conexión en Windows
@@ -538,59 +503,10 @@ class AntiDetectionDriver:
         
         time.sleep(get_action_delay('click') / 1000)
     
-    # Umbral: mensajes más largos que esto se inyectan vía JS (instantáneo)
-    FAST_TYPE_THRESHOLD = 100
-
-    def _inject_text_js(self, element, text: str) -> bool:
-        """
-        Inyecta texto en un elemento React usando el setter nativo del InputEvent.
-        Engaña al framework para que registre el cambio en su estado interno.
-        Retorna True si tuvo éxito, False si falla (fallback a send_keys).
-        """
-        try:
-            # Escape de caracteres especiales para JSON seguro en JS
-            escaped = text.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
-            js = f"""
-(function(el, text) {{
-    // Obtener el setter nativo de HTMLTextAreaElement (bypassea React)
-    var nativeInput = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype, 'value'
-    );
-    if (!nativeInput) {{
-        // Fallback para <div contenteditable>
-        nativeInput = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-        );
-    }}
-    if (nativeInput && nativeInput.set) {{
-        nativeInput.set.call(el, text);
-        // Disparar eventos que React escucha para actualizar su estado
-        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        return true;
-    }}
-    return false;
-}})(arguments[0], `{escaped}`);
-"""
-            result = self._driver.execute_script(js, element)
-            if result:
-                self.logger.debug(f"JS inject OK ({len(text)} chars)")
-                return True
-            self.logger.debug("JS inject: nativeInput no disponible, fallback")
-            return False
-        except Exception as e:
-            self.logger.debug(f"JS inject error: {e}")
-            return False
-
     def human_type(self, element, text: str, clear_first: bool = True):
         """
-        Escribe texto en un elemento web.
-
-        - Mensajes cortos (≤ FAST_TYPE_THRESHOLD chars): escritura humana simulada
-          con delays aleatorios para parecer natural.
-        - Mensajes largos (> FAST_TYPE_THRESHOLD chars): inyección JS instantánea
-          via nativeInputValueSetter (React-compatible, prácticamente indetectable).
-
+        Escribe texto de forma humana.
+        
         Args:
             element: Elemento donde escribir
             text: Texto a escribir
@@ -598,28 +514,17 @@ class AntiDetectionDriver:
         """
         from selenium.webdriver.common.action_chains import ActionChains
         from selenium.webdriver.common.keys import Keys
-
+        
         self.human_click(element)
-
+        
         if clear_first:
             ActionChains(self._driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
             time.sleep(random.uniform(0.1, 0.2))
             element.send_keys(Keys.BACKSPACE)
-            time.sleep(random.uniform(0.05, 0.15))
-
-        if len(text) > self.FAST_TYPE_THRESHOLD:
-            # === MODO RÁPIDO: JS injection para textos largos ===
-            self.logger.debug(f"Usando JS injection para texto largo ({len(text)} chars)")
-            success = self._inject_text_js(element, text)
-            if success:
-                # Pausa breve post-inyección para que React procese el estado
-                time.sleep(random.uniform(0.15, 0.3))
-                return
-            # Si falla el JS, caemos al modo humano (fallback)
-            self.logger.warning("JS injection falló, usando escritura carácter a carácter")
-
-        # === MODO HUMANO: escritura carácter a carácter para textos cortos ===
+            time.sleep(random.uniform(0.1, 0.3))
+        
         sequence = self.human.typing.generate_typing_sequence(text)
+        
         for char, delay in sequence:
             if char == '[PAUSE]':
                 time.sleep(delay / 1000)
@@ -629,7 +534,6 @@ class AntiDetectionDriver:
             else:
                 element.send_keys(char)
                 time.sleep(delay / 1000)
-
     
     def human_scroll(self, distance: int, direction: str = 'down'):
         """
@@ -725,7 +629,7 @@ class AntiDetectionDriver:
         self._post_navigation_behavior()
     
     def close(self):
-        """Cierra el driver y realiza una limpieza post-mortem."""
+        """Cierra el driver."""
         if self._driver:
             try:
                 self._driver.quit()
@@ -734,51 +638,10 @@ class AntiDetectionDriver:
             finally:
                 self._driver = None
                 self._is_initialized = False
-                # Intentar limpiar la caché si es posible luego de cerrar
-                profile_dir = os.path.join(self.config.profile_dir, self.profile_id)
-                self._clean_profile_cache(profile_dir)
     
     def quit(self):
         """Alias para close()."""
         self.close()
-        
-    def _clean_profile_cache(self, profile_dir: str):
-        """
-        Limpia carpetas basura de Chrome que inflan el disco, conservando
-        únicamente la persistencia de cookies de inicio de sesión.
-        """
-        import shutil
-        import stat
-        
-        # Targets conocidos por su enorme consumo de espacio y poco valor transaccional
-        cache_targets = [
-            "Default/Cache",
-            "Default/Code Cache",
-            "Default/Service Worker",
-            "Default/GPUCache",
-            "Default/DawnCache",
-            "GrShaderCache",
-            "ShaderCache",
-            "Crashpad",
-            "GraphiteDawnCache"
-        ]
-        
-        # Función recursiva para forzar borrado saltando permisos de "solo lectura" en Windows
-        def on_rm_error(func, path, exc_info):
-            try:
-                os.chmod(path, stat.S_IWRITE)
-                func(path)
-            except Exception:
-                pass
-
-        for target in cache_targets:
-            target_path = os.path.join(profile_dir, os.path.normpath(target))
-            if os.path.exists(target_path):
-                try:
-                    shutil.rmtree(target_path, onerror=on_rm_error)
-                    self.logger.debug(f"Purgado: {target}")
-                except Exception as e:
-                    self.logger.debug(f"No se pudo limpiar {target}: {e}")
     
     def enable_spy_mode(self):
         """Inyecta el script de espionaje para monitorear el DOM."""

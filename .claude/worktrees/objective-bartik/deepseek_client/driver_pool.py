@@ -15,8 +15,6 @@ Características:
 import threading
 import time
 import logging
-import json
-import os
 from typing import Optional, List, Callable, Any
 from dataclasses import dataclass, field
 from queue import Queue, Empty
@@ -133,7 +131,6 @@ class DriverPool:
         self._drivers: List[DriverWrapper] = []
         self._available: Queue = Queue()
         self._lock = threading.RLock()
-        self._health_check_event = threading.Event()  # Semáforo de Garbage Collector
         self._next_id = 0
         self._is_running = False
         self._health_thread: Optional[threading.Thread] = None
@@ -142,51 +139,32 @@ class DriverPool:
             self.start()
     
     def start(self):
-        """Inicia el pool y crea los drivers iniciales concurrentemente."""
+        """Inicia el pool y crea los drivers iniciales."""
         with self._lock:
             if self._is_running:
                 return
+            
+            self.logger.info(f"Iniciando pool de drivers (tamaño: {self.size})")
+            
+            # Crear drivers iniciales
+            for i in range(self.size):
+                try:
+                    wrapper = self._create_driver()
+                    self._drivers.append(wrapper)
+                    self._available.put(wrapper.driver_id)
+                except Exception as e:
+                    self.logger.error(f"Error creando driver {i}: {e}")
+            
             self._is_running = True
             
-        self.logger.info(f"Iniciando pool de drivers en paralelo (tamaño: {self.size})")
-        
-        # Iniciar drivers concurrentemente fuera del lock principal
-        try:
-            with ThreadPoolExecutor(max_workers=self.size) as executor:
-                futures = []
-                for i in range(self.size):
-                    futures.append(executor.submit(self._create_and_register_driver, i))
-                
-                # Esperar a que todos terminen
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as e:
-                        self.logger.error(f"Error en creacion paralela de driver: {e}")
-                        
-        except Exception as e:
-            self.logger.error(f"Falla fatal iniciando pool: {e}")
-        
-        # Iniciar thread de health check
-        self._health_thread = threading.Thread(
-            target=self._health_check_loop,
-            daemon=True
-        )
-        self._health_thread.start()
-        
-        with self._lock:
-            self.logger.info(f"Pool iniciado con {len(self._drivers)} drivers")
+            # Iniciar thread de health check
+            self._health_thread = threading.Thread(
+                target=self._health_check_loop,
+                daemon=True
+            )
+            self._health_thread.start()
             
-    def _create_and_register_driver(self, index: int):
-        """Metodo helper para paralelizar la creacion y registro."""
-        try:
-            wrapper = self._create_driver()
-            with self._lock:
-                self._drivers.append(wrapper)
-                self._available.put(wrapper.driver_id)
-        except Exception as e:
-            self.logger.error(f"Error creando driver hilo {index}: {e}")
-            raise
+            self.logger.info(f"Pool iniciado con {len(self._drivers)} drivers")
     
     def _create_driver(self) -> DriverWrapper:
         """
@@ -202,27 +180,13 @@ class DriverPool:
         # Perfil aleatorio para cada driver
         profile = get_random_profile()
         
-        # El primer driver del pool reutiliza el perfil con sesión guardada.
-        # Los drivers adicionales usan perfiles aislados para no corromper cookies.
-        if driver_id == 0:
-            profile_id = "deepseek_main"
-        else:
-            profile_id = f"pool_driver_{driver_id}"
-        
-        self.logger.info(f"Creando driver {driver_id} con perfil {profile.name} (profile_id: {profile_id})")
+        self.logger.info(f"Creando driver {driver_id} con perfil {profile.name}")
         
         driver = AntiDetectionDriver(
             profile=profile,
             config_obj=self.config,
-            profile_id=profile_id
+            profile_id=f"pool_driver_{driver_id}"
         )
-        
-        # Asegurar navegación inicial para que el pool esté "caliente"
-        try:
-            self.logger.info(f"Navegando driver {driver_id} a {self.config.deepseek_url}...")
-            driver.get(self.config.deepseek_url)
-        except Exception as e:
-            self.logger.warning(f"Error en navegacion inicial de driver {driver_id}: {e}")
         
         return DriverWrapper(
             driver=driver,
@@ -297,9 +261,6 @@ class DriverPool:
         
         wrapper.is_busy = False
         self._available.put(wrapper.driver_id)
-        # Despertar proactivamente al health checker (Inversión de Control)
-        if hasattr(self, '_health_check_event'):
-            self._health_check_event.set()
     
     @contextmanager
     def get_driver(self, timeout: float = 30):
@@ -368,78 +329,67 @@ class DriverPool:
         return results
     
     def _health_check_loop(self):
-        """Loop reactivo de health checks y exportación de métricas (Event-Driven)."""
-        # Config no tiene base_dir — lo derivamos del profile_dir (que es .../deepseek_client/browser_profiles)
-        base_dir = os.path.dirname(os.path.dirname(self.config.profile_dir))
-        metrics_file = os.path.join(base_dir, "metrics.json")
+        """Loop de health checks en background."""
         while self._is_running:
-            # Espera híbrida: Por tiempo máximo o hasta que un driver ordene despertar
-            self._health_check_event.wait(timeout=self.health_check_interval)
-            self._health_check_event.clear()
-            
-            if not self._is_running: break
-            
+            time.sleep(self.health_check_interval)
             self._perform_health_check()
-            
-            # Exportar métricas para el Dashboard
-            try:
-                status = self.get_status()
-                with open(metrics_file, "w", encoding="utf-8") as f:
-                    json.dump(status, f, indent=4)
-            except Exception as e:
-                self.logger.debug(f"Error exportando métricas JSON: {e}")
     
     def _perform_health_check(self):
         """Realiza health check de todos los drivers."""
         self.logger.debug("Realizando health check...")
-
-        # FIX #7: solo recolectar bajo el lock, sin ops lentas adentro
+        
         with self._lock:
             drivers_to_replace = []
-
+            
             for wrapper in self._drivers:
-                # FIX #6: age check ahora respeta is_busy
-                if wrapper.get_age() > self.max_age and not wrapper.is_busy:
+                # Verificar edad
+                if wrapper.get_age() > self.max_age:
                     self.logger.info(f"Driver {wrapper.driver_id} excedió edad máxima")
                     drivers_to_replace.append(wrapper)
                     continue
-
+                
+                # Verificar tiempo inactivo (solo si no está ocupado)
                 if not wrapper.is_busy and wrapper.get_idle_time() > self.max_idle:
                     self.logger.info(f"Driver {wrapper.driver_id} inactivo por demasiado tiempo")
                     drivers_to_replace.append(wrapper)
                     continue
-
+                
+                # Verificar salud
                 if not wrapper.is_healthy():
                     self.logger.warning(f"Driver {wrapper.driver_id} no saludable")
                     drivers_to_replace.append(wrapper)
-
-        # FIX #7: close() y create_driver() (lanzar Chrome) fuera del lock
-        for wrapper in drivers_to_replace:
-            self._replace_driver(wrapper)
+            
+            # Reemplazar drivers necesarios
+            for wrapper in drivers_to_replace:
+                self._replace_driver(wrapper)
     
     def _replace_driver(self, old_wrapper: DriverWrapper):
         """
         Reemplaza un driver por uno nuevo.
-
+        
         Args:
             old_wrapper: Wrapper del driver a reemplazar
         """
         self.logger.info(f"Reemplazando driver {old_wrapper.driver_id}")
-
+        
         try:
+            # Cerrar driver antiguo
             old_wrapper.driver.close()
         except Exception as e:
             self.logger.warning(f"Error cerrando driver antiguo: {e}")
-
-        # create_driver puede tardar segundos (lanza Chrome) — ya está fuera del lock
+        
+        # Crear nuevo driver
         new_wrapper = self._create_driver()
-
+        
         with self._lock:
+            # Actualizar lista de drivers
             self._drivers = [
-                w for w in self._drivers
+                w for w in self._drivers 
                 if w.driver_id != old_wrapper.driver_id
             ]
             self._drivers.append(new_wrapper)
+            
+            # Añadir a disponibles
             self._available.put(new_wrapper.driver_id)
     
     def get_status(self) -> dict:
@@ -476,111 +426,69 @@ class DriverPool:
     
     def resize(self, new_size: int):
         """
-        Cambia el tamaño del pool dinamicamente.
-
+        Cambia el tamaño del pool.
+        
         Args:
             new_size: Nuevo tamaño del pool
         """
-        if new_size == self.size:
-            return
+        with self._lock:
+            self.logger.info(f"Cambiando tamaño del pool: {self.size} -> {new_size}")
             
-        self.logger.info(f"Cambiando tamaño del pool: {self.size} -> {new_size}")
-        
-        if new_size > self.size:
-            # Expandir concurrentemente
-            diff = new_size - self.size
-            with ThreadPoolExecutor(max_workers=diff) as executor:
-                futures = []
-                for i in range(diff):
-                    futures.append(executor.submit(self._create_and_register_driver, i))
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as e:
-                        self.logger.error(f"Error en resize (expansion): {e}")
-
-        elif new_size < self.size:
-            # Reducir concurrentemente
-            to_remove = self.size - new_size
-            removed = 0
-            removed_ids = set()
-            drivers_to_close = []
-
-            with self._lock:
+            if new_size > self.size:
+                # Añadir drivers
+                for _ in range(new_size - self.size):
+                    wrapper = self._create_driver()
+                    self._drivers.append(wrapper)
+                    self._available.put(wrapper.driver_id)
+            
+            elif new_size < self.size:
+                # Eliminar drivers (solo los disponibles)
+                to_remove = self.size - new_size
+                removed = 0
+                
                 for wrapper in list(self._drivers):
                     if removed >= to_remove:
                         break
-
+                    
                     if not wrapper.is_busy:
-                        # Extraer del pool inmediatamente, cerrar despues
-                        drivers_to_close.append(wrapper.driver)
-                        removed_ids.add(wrapper.driver_id)
+                        try:
+                            wrapper.driver.close()
+                        except Exception:
+                            pass
+                        
                         self._drivers.remove(wrapper)
                         removed += 1
-
-                # Reconstruir queue
-                if removed_ids:
-                    new_available = Queue()
-                    while not self._available.empty():
-                        try:
-                            did = self._available.get_nowait()
-                            if did not in removed_ids:
-                                new_available.put(did)
-                        except Empty:
-                            break
-                    self._available = new_available
             
-            # Cerrar drivers extraídos en paralelo, fuera del lock
-            if drivers_to_close:
-                with ThreadPoolExecutor(max_workers=len(drivers_to_close)) as executor:
-                    for d in drivers_to_close:
-                        executor.submit(self._safe_close_driver, d)
-
-        with self._lock:
             self.size = new_size
-            
-    def _safe_close_driver(self, driver):
-        """Helper para cerrar driver silenciando errores menore."""
-        try:
-            driver.close()
-        except Exception as e:
-            self.logger.debug(f"Error cerrando driver en bg: {e}")
     
     def close(self):
-        """Cierra todos los drivers y detiene el pool en paralelo."""
-        self.logger.info("Cerrando pool de drivers concurrentemente...")
+        """Cierra todos los drivers y detiene el pool."""
+        self.logger.info("Cerrando pool de drivers...")
         
         self._is_running = False
-        # Despertar al hilo huérfano para muerte inmediata
-        if hasattr(self, '_health_check_event'):
-            self._health_check_event.set()
         
         # Esperar a que termine el thread de health check
         if self._health_thread and self._health_thread.is_alive():
             self._health_thread.join(timeout=5)
         
-        drivers_to_close = []
-        # Extraer todos bajo el lock
+        # Cerrar todos los drivers
         with self._lock:
             for wrapper in self._drivers:
-                drivers_to_close.append(wrapper.driver)
+                try:
+                    wrapper.driver.close()
+                except Exception as e:
+                    self.logger.warning(f"Error cerrando driver {wrapper.driver_id}: {e}")
             
             self._drivers.clear()
             
-            # Vaciar cola
+            # Vaciar cola de disponibles
             while not self._available.empty():
                 try:
                     self._available.get_nowait()
                 except Empty:
                     break
         
-        # Cerrar en paralelo
-        if drivers_to_close:
-            with ThreadPoolExecutor(max_workers=len(drivers_to_close)) as executor:
-                for d in drivers_to_close:
-                    executor.submit(self._safe_close_driver, d)
-        
-        self.logger.info("Pool cerrado exitosamente")
+        self.logger.info("Pool cerrado")
     
     def __enter__(self):
         """Context manager entry."""

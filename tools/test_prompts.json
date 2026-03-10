@@ -1,0 +1,18 @@
+[
+  {
+    "id": 1,
+    "prompt": "Escribe una oración corta sobre la luna."
+  },
+  {
+    "id": 2,
+    "prompt": "Escribe un poema de 4 líneas sobre el sol. Asegúrate de mencionar el color amarillo."
+  },
+  {
+    "id": 3,
+    "prompt": "Explícame qué es el agua en exactamente 2 palabras."
+  },
+  {
+    "id": 4,
+    "prompt": "Genera una lista con viñetas de 5 lenguajes de programación, solo los nombres."
+  }
+]

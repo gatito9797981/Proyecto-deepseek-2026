@@ -37,7 +37,6 @@ from .config import Config, config
 from .driver import AntiDetectionDriver, create_driver
 from .history import HistoryManager, Conversation, Message
 from .human_behavior import get_action_delay, simulate_reading_time
-from .token_manager import TokenManager
 
 
 class DeepSeekModel(Enum):
@@ -171,7 +170,6 @@ class DeepSeekClient:
         self._current_model = DeepSeekModel.DEEPSEEK_CHAT
         self._last_response: Optional[DeepSeekResponse] = None
         self._conversation_started = False
-        self._interaction_count = 0  # <--- Trust Score para Bypass JS
 
         self.api_headers = {
             "x-app-version": "20241129.1",
@@ -179,19 +177,10 @@ class DeepSeekClient:
             "x-client-platform": "web"
         }
 
-        self.token_manager = TokenManager(
-            driver=self.driver.driver, # Raw Selenium WebDriver
-            logger=self.logger,
-            alert_callback=self._handle_token_alert
-        )
+
 
         if auto_login:
             self._navigate_to_deepseek()
-
-    def _handle_token_alert(self, message: str):
-        """Callback ejecutado por el TokenManager si la sesión está en peligro."""
-        self.logger.critical(message)
-        print(f"\n\033[91m{message}\033[0m\n")
 
     def _navigate_to_deepseek(self):
         """Navega a DeepSeek de forma optimizada."""
@@ -202,15 +191,8 @@ class DeepSeekClient:
             # Esperar a que la página cargue y detecte el input
             # No intentamos inyectar ya que el perfil deepseek_main mantiene la sesión
             self._wait_for_chat_input(timeout=30)
-            
-            # Inyectar interceptor de tráfico de red para respuestas multi-turno perfectas
-            self._inject_network_interceptor()
-            
             self._is_logged_in = True
             self.logger.info("DeepSeek cargado y sesión detectada correctamente")
-            
-            # Iniciar monitoreo del Token JWT
-            self.token_manager.start_monitoring()
             
         except TimeoutException:
             self.logger.warning("No se detectó el chat input. Es posible que se requiera intervención manual.")
@@ -218,173 +200,6 @@ class DeepSeekClient:
             self.logger.error(f"Error crítico en navegación: {e}")
             raise e
 
-    def _inject_network_interceptor(self):
-        script = """
-        if (!window.__deepseek_network_hooked) {
-            window.__deepseek_responses = [];
-            window.__deepseek_current_stream = "";
-            window.__deepseek_current_think = "";
-            window.__deepseek_status = "idle";
-            window.__deepseek_active_request_id = null;
-
-            // Objeto para rastrear el estado de cada petición de forma aislada
-            const requestStates = {};
-
-            function processChunk(chunk, requestId) {
-                if (requestId !== window.__deepseek_active_request_id) return;
-                
-                const state = requestStates[requestId];
-                if (!state) return;
-
-                const lines = chunk.split('\\n');
-                for (const line of lines) {
-                    if (!line.startsWith('data: ') || line.includes('[DONE]')) continue;
-                    try {
-                        const data = JSON.parse(line.substring(6));
-                        
-                        // Señales de fin
-                        if (data.p === "response/status" && data.v === "FINISHED") {
-                            window.__deepseek_status = "finished";
-                            continue;
-                        }
-                        if (data.v === "FINISHED") {
-                            window.__deepseek_status = "finished";
-                            continue;
-                        }
-
-                        // 1. Fragmentos iniciales
-                        if (data.v && data.v.response && data.v.response.fragments) {
-                            const frags = data.v.response.fragments;
-                            for (const f of frags) {
-                                if (f.type === 'THINK') {
-                                    if (f.content) window.__deepseek_current_think += f.content;
-                                    state.target = 'think';
-                                } else if (f.type === 'RESPONSE') {
-                                    if (f.content) window.__deepseek_current_stream += f.content;
-                                    state.target = 'stream';
-                                }
-                            }
-                            continue;
-                        }
-
-                        // 2. Fragmentos dinámicos (Nuevos fragmentos añadidos al array)
-                        if (data.p === 'response/fragments' && Array.isArray(data.v)) {
-                            for (const f of data.v) {
-                                if (f.type === 'THINK') {
-                                    if (f.content) window.__deepseek_current_think += f.content;
-                                    state.target = 'think';
-                                } else if (f.type === 'RESPONSE') {
-                                    if (f.content) window.__deepseek_current_stream += f.content;
-                                    state.target = 'stream';
-                                }
-                            }
-                            continue;
-                        }
-
-                        // 3. Mutación APPEND (Añadir texto al último fragmento activo)
-                        if (data.p && typeof data.p === 'string' && data.p.includes('/content') && data.v && typeof data.v === 'string') {
-                            if (state.target === 'think') {
-                                window.__deepseek_current_think += data.v;
-                            } else {
-                                window.__deepseek_current_stream += data.v;
-                            }
-                            continue;
-                        }
-
-                        // 4. Mutación implícita de continuación (solo v string)
-                        if (data.v && typeof data.v === 'string' && !data.p) {
-                            if (state.target === 'think') {
-                                window.__deepseek_current_think += data.v;
-                            } else {
-                                window.__deepseek_current_stream += data.v;
-                            }
-                        }
-
-                    } catch(e) {}
-                }
-            }
-
-            // ── FETCH HOOK ──
-            const originalFetch = window.fetch;
-            window.fetch = async function(...args) {
-                const response = await originalFetch.apply(this, args);
-                const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-                
-                if (url.includes('/chat/completion') || url.includes('/v0/chat')) {
-                    const myRequestId = Date.now() + '_' + Math.random();
-                    window.__deepseek_active_request_id = myRequestId;
-                    window.__deepseek_current_stream = "";
-                    window.__deepseek_current_think = "";
-                    window.__deepseek_status = "generating";
-                    
-                    // Inicializar estado de esta petición
-                    requestStates[myRequestId] = { target: 'think' };
-
-                    const clonedResponse = response.clone();
-                    const reader = clonedResponse.body.getReader();
-                    const decoder = new TextDecoder("utf-8");
-                    
-                    function readStream() {
-                        reader.read().then(({ done, value }) => {
-                            if (done) {
-                                delete requestStates[myRequestId];
-                                return;
-                            }
-                            if (myRequestId !== window.__deepseek_active_request_id) {
-                                delete requestStates[myRequestId];
-                                return;
-                            }
-                            processChunk(decoder.decode(value, { stream: true }), myRequestId);
-                            readStream();
-                        }).catch(() => { delete requestStates[myRequestId]; });
-                    }
-                    readStream();
-                }
-                return response;
-            };
-
-            // ── XHR HOOK ──
-            const XHR = window.XMLHttpRequest;
-            const originalOpen = XHR.prototype.open;
-            const originalSend = XHR.prototype.send;
-
-            XHR.prototype.open = function(method, url) {
-                this._url = url;
-                return originalOpen.apply(this, arguments);
-            };
-
-            XHR.prototype.send = function() {
-                if (this._url && (this._url.includes('/chat/completion') || this._url.includes('/v0/chat'))) {
-                    const myRequestId = Date.now() + '_' + Math.random();
-                    window.__deepseek_active_request_id = myRequestId;
-                    window.__deepseek_current_stream = "";
-                    window.__deepseek_current_think = "";
-                    window.__deepseek_status = "generating";
-                    
-                    requestStates[myRequestId] = { target: 'think' };
-
-                    let lastIndex = 0;
-                    this.addEventListener('readystatechange', function() {
-                        if (myRequestId !== window.__deepseek_active_request_id) return;
-                        if ((this.readyState === 3 || this.readyState === 4) && this.responseText) {
-                            const newText = this.responseText.substring(lastIndex);
-                            lastIndex = this.responseText.length;
-                            processChunk(newText, myRequestId);
-                        }
-                        if (this.readyState === 4) delete requestStates[myRequestId];
-                    });
-                }
-                return originalSend.apply(this, arguments);
-            };
-
-            window.__deepseek_network_hooked = true;
-        }
-        """
-        try:
-            self.driver.driver.execute_script(script)
-            self.logger.info("Network Interceptor inyectado correctamente")
-        except Exception as e:
-            self.logger.error(f"Fallo al inyectar interceptor de red: {e}")
 
     def _wait_for_chat_input(self, timeout: float = 30):
         """Espera a que la página de chat esté lista."""
@@ -475,7 +290,7 @@ class DeepSeekClient:
     def _get_send_button(self):
         """Obtiene el botón de enviar usando heurística universal."""
         # 1. Intentar por selector directo (que ahora incluye div[role="button"])
-        element = self._find_element_safe('send_button', timeout=1)
+        element = self._find_element_safe('send_button', timeout=1) or self._find_element_safe('send_button_fallback', timeout=1)
         if element and element.is_displayed() and element.get_attribute("aria-disabled") != "true":
             return element
             
@@ -483,188 +298,84 @@ class DeepSeekClient:
         return self._find_button_by_heuristics(["send", "enviar", "confirmar"])
 
     def _is_generating(self) -> bool:
-        """Detecta generación activa por crecimiento del contenido + DOM."""
-        script = """
-        try {
-            // 1. Buscar botón stop por SVG path (más estable que clases)
-            let svgPaths = document.querySelectorAll('path');
-            for (let p of svgPaths) {
-                let d = p.getAttribute('d') || '';
-                // Rectángulo stop de DeepSeek (varias variantes)
-                if (d.startsWith('M2') || d.includes('4.88') || d.includes('19.12')) return true;
-            }
-            
-            // 2. Cualquier elemento con clase que contenga "stop" o "loading"
-            let all = document.querySelectorAll('[class]');
-            for (let el of all) {
-                let cls = el.className || '';
-                if (typeof cls === 'string' && (
-                    cls.includes('stop') || 
-                    cls.includes('loading') || 
-                    cls.includes('generating') ||
-                    cls.includes('blink') ||
-                    cls.includes('cursor')
-                )) return true;
-            }
-            
-            // 3. Input deshabilitado = está generando
-            let textarea = document.querySelector('textarea');
-            if (textarea && textarea.disabled) return true;
-            
-        } catch(e) {}
-        return false;
-        """
-        try:
-            return bool(self.driver.driver.execute_script(script))
-        except Exception:
-            return False
+        """Verifica si el modelo está generando usando heurística universal."""
+        # 1. Buscar indicador de carga visual
+        loading = self._find_element_safe('generating_indicator', timeout=0.1)
+        if loading: return True
+        
+        # 2. Buscar botón de parar
+        stop_btn = self._find_button_by_heuristics(["stop", "parar", "detener"])
+        return stop_btn is not None
 
     def _wait_for_response(self, timeout: float = None) -> Generator[str, None, None]:
         """
-        Espera la respuesta del modelo y la devuelve como stream entrelazado.
-
-        Estrategia de detección de fin (en orden de prioridad):
-          1. SEÑAL PRIMARIA:  El botón Stop del DOM desaparece → DeepSeek terminó de generar.
-          2. SEÑAL SECUNDARIA: Si el contenido no creció en 2.5s Y no hay Stop → fin seguro.
-          3. TIMEOUT: Si se supera el límite de tiempo configurado → error.
-
-        Esto evita cortes en respuestas largas (el Stop sigue presente hasta el último token).
+        Espera la respuesta del modelo y la devuelve como stream.
 
         Yields:
-            str: Partes de la respuesta (pensamiento + texto final)
+            str: Partes de la respuesta
         """
         timeout = timeout or self.config.response_timeout
         start_time = time.time()
 
-        last_content  = ""
-        last_thinking = ""
-        last_growth_time = time.time()
-        has_emitted_thinking_header = False
-        has_emitted_response_header = False
-
-        # Script JS reutilizable para detectar si el botón Stop está visible
-        _JS_IS_GENERATING = """
-        try {
-            if (window.__deepseek_status === "generating") return true;
-            if (window.__deepseek_status === "finished") return false;
-            
-            // DeepSeek muestra un botón de "Stop" (aria-label o SVG de cuadrado) mientras genera.
-            // Cuando termina, ese botón desaparece o se reemplaza por el botón Send.
-            let stopBtns = document.querySelectorAll(
-                'button[aria-label*="stop" i], button[aria-label*="detener" i], ' +
-                'button[data-testid*="stop" i], ' +
-                'div[role="button"] svg rect[width="10"], ' +
-                'button.stop-btn, button._stop'
-            );
-            // Alternativa: el botón de enviar tiene disabled=true mientras genera
-            let sendBtn = document.querySelector(
-                'button[aria-label*="send" i], button[aria-label*="enviar" i], ' +
-                'div[role="button"][aria-label*="send" i]'
-            );
-            if (stopBtns.length > 0) return true;
-            if (sendBtn && (sendBtn.disabled || sendBtn.getAttribute('aria-disabled') === 'true')) return true;
-            return false;
-        } catch(e) { return false; }
-        """
-
-        # Esperar montaje inicial de React
-        time.sleep(0.8)
-
-        stop_seen_once = False
+        last_content = ""
+        stable_count = 0
+        max_stable_checks = 3  # Aumentado para asegurar que la UI esté lista para el próximo mensaje
 
         while time.time() - start_time < timeout:
             try:
-                thinking_content = self._get_thinking_content()
-                content          = self._get_response_content()
+                is_generating = self._is_generating()
+                content = self._get_response_content()
 
-                try:
-                    is_generating = bool(self.driver.driver.execute_script(_JS_IS_GENERATING))
-                except Exception:
-                    is_generating = False
-
-                if is_generating:
-                    stop_seen_once = True  # Confirmamos que el Stop apareció al menos una vez
-
-                # ── 1. Emitir Pensamiento (DeepThink R1) ──────────────────────
-                if thinking_content and len(thinking_content) > len(last_thinking):
-                    if not has_emitted_thinking_header:
-                        yield "\n\n🤔 **Pensamiento de DeepSeek:**\n"
-                        has_emitted_thinking_header = True
-                    new_thinking = thinking_content[len(last_thinking):]
-                    yield new_thinking
-                    last_thinking = thinking_content
-                    last_growth_time = time.time()
-
-                # ── 2. Emitir Respuesta Final ──────────────────────────────────
                 if content and len(content) > len(last_content):
-                    if not has_emitted_response_header:
-                        yield "\n\n💡 **Respuesta:**\n"
-                        has_emitted_response_header = True
                     new_content = content[len(last_content):]
                     yield new_content
                     last_content = content
-                    last_growth_time = time.time()
+                    stable_count = 0
 
-                # ── 3. Detección de fin ────────────────────────────────────────
-                has_content = bool(content or thinking_content)
-                time_since_growth = time.time() - last_growth_time
+                if not is_generating and content:
+                    stable_count += 1
+                    if stable_count >= max_stable_checks:
+                        self.logger.debug("Respuesta completa detectada")
+                        return  # FIX 3: return sin valor — en generator, return valor es código muerto
 
-                if stop_seen_once and not is_generating:
-                    # El botón Stop desapareció: DeepSeek terminó de generar.
-                    # Solo esperamos un breve margen para el flush final del DOM.
-                    if time_since_growth >= 1.2:
-                        # Flush final: capturar cualquier token rezagado
-                        final_think = self._get_thinking_content()
-                        final_text  = self._get_response_content()
-                        if final_think and len(final_think) > len(last_thinking):
-                            yield final_think[len(last_thinking):]
-                        if final_text and len(final_text) > len(last_content):
-                            yield final_text[len(last_content):]
-                        return
-
-                elif not is_generating and has_content and not stop_seen_once:
-                    # El Stop nunca apareció (respuesta instantánea o error de detección):
-                    # usar fallback por inactividad de 2.5s
-                    if time_since_growth >= 2.5:
-                        final_think = self._get_thinking_content()
-                        final_text  = self._get_response_content()
-                        if final_think and len(final_think) > len(last_thinking):
-                            yield final_think[len(last_thinking):]
-                        if final_text and len(final_text) > len(last_content):
-                            yield final_text[len(last_content):]
-                        return
-
-                time.sleep(0.08)  # Tick de 80ms → mayor fluidez que 100ms
+                time.sleep(0.1)
 
             except StaleElementReferenceException:
-                time.sleep(0.4)
+                time.sleep(0.5)
                 continue
             except Exception as e:
                 self.logger.warning(f"Error esperando respuesta: {e}")
-                time.sleep(0.4)
+                time.sleep(0.5)
 
         if not last_content:
             raise TimeoutException("Timeout esperando respuesta de DeepSeek")
 
     def _get_response_content(self) -> str:
-        """
-        Obtiene el contenido de la respuesta NUEVA usando el 
-        Interceptor de Red, sin tocar NINGUN selector del DOM.
-        """
-        script = "return window.__deepseek_current_stream || '';"
+        """Obtiene el contenido de la respuesta actual (Detección Heurística)."""
         try:
-            result = self.driver.driver.execute_script(script)
-            return str(result) if result else ""
-        except Exception:
-            return ""
+            # Prioridad 1: Burbujas de mensaje con markdown (usando selectores configurados)
+            for selector in ['message_bubble', 'response_markdown']:
+                by, value = self.SELECTORS[selector]
+                elements = self.driver.driver.find_elements(by, value)
+                if elements:
+                    return elements[-1].text.strip()
+            
+            # Prioridad 2: Buscar bloques markdown o mensajes por clases genéricas
+            md_blocks = self.driver.driver.find_elements(By.CSS_SELECTOR, '.ds-markdown, [class*="markdown"], [class*="message"]')
+            if md_blocks:
+                return md_blocks[-1].text.strip()
+        except Exception as e:
+            self.logger.debug(f"Error detectando contenido heurístico: {e}")
+        return ""
 
     def _get_thinking_content(self) -> str:
-        """Obtiene el 'pensamiento' (R1) usando el Interceptor de Red en memoria JS."""
-        script = "return window.__deepseek_current_think || '';"
+        """Obtiene el contenido del 'pensamiento' (DeepThink) si está disponible."""
         try:
-            result = self.driver.driver.execute_script(script)
-            return str(result) if result else ""
-        except Exception:
+            by, value = self.SELECTORS['thinking_content']
+            elements = self.driver.driver.find_elements(by, value)
+            return elements[-1].text.strip() if elements else ""
+        except Exception as e:
+            self.logger.debug(f"Error obteniendo pensamiento: {e}")
             return ""
 
     def _check_for_errors(self) -> Optional[str]:
@@ -683,60 +394,28 @@ class DeepSeekClient:
     def _send_message(self, message: str) -> None:
         """
         Envía un mensaje a DeepSeek con redundancia ante fallos de UI.
-        Incorpora un Bypass JS "Atómico" de latencia nula si ya hay Trust Score.
-        """
-        try:
-            self.driver.driver.execute_script("window.__deepseek_current_stream = ''; window.__deepseek_current_think = ''; window.__deepseek_status = 'idle';")
-        except: pass
 
+        Args:
+            message: Mensaje a enviar
+        """
         for attempt in range(2):
             try:
                 chat_input = self._get_chat_input()
+                # FIX #4: human_type siempre, no solo en attempt=0
+                # En retry el input puede estar vacío (stale tras refetch)
+                self.driver.human_type(chat_input, message, clear_first=True)
+                time.sleep(random.uniform(0.3, 0.6))
                 send_button = self._get_send_button()
-                
-                # Zero-Latency JS Bypass: Si ya demostramos humanidad 2 veces, inyecar texto atómicamente
-                if getattr(self, '_interaction_count', 0) >= 2 and send_button:
-                    self.logger.info("🚀 Usando Bypass Atómico JS para escribir sin latencia humana...")
-                    script = """
-                    let input = arguments[0];
-                    let text = arguments[1];
-                    let btn = arguments[2];
-                    
-                    // Rellenar contenido engañando al State de React
-                    let nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
-                    nativeInputValueSetter.call(input, text);
-                    // React 15+ requiere ambos eventos y con bubbles: true
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                    
-                    // Asegurar que React detecte el cambio de estado antes del clic
-                    setTimeout(() => {
-                        if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-                            btn.click();
-                        }
-                    }, 50);
-                    """
-                    self.driver.driver.execute_script(script, chat_input, message, send_button)
-                    self._interaction_count += 1
-                    time.sleep(0.1) # Breve pausa por el setTimeout
-                else:
-                    self.logger.info(f"Escritura lenta de validación humana en curso... (Trust Score: {getattr(self, '_interaction_count', 0)}/2)")
-                    self.driver.human_type(chat_input, message, clear_first=True)
-                    time.sleep(random.uniform(0.3, 0.6))
-                    send_button = self._get_send_button()
-                    if send_button and send_button.is_enabled():
-                        try:
-                            self.driver.driver.execute_script("arguments[0].click();", send_button)
-                            time.sleep(0.3)
-                        except Exception as e:
-                            self.logger.warning(f"Fallo clic JS, usando Ctrl+Enter: {e}")
-                            chat_input.send_keys(Keys.CONTROL, Keys.RETURN)
-                    else:
-                        # Fallback directo a teclas de envío si no hay botón
+                if send_button and send_button.is_enabled():
+                    try:
+                        self.driver.driver.execute_script("arguments[0].click();", send_button)
+                        time.sleep(0.3)
+                    except Exception as e:
+                        self.logger.warning(f"Fallo clic JS, usando Ctrl+Enter: {e}")
                         chat_input.send_keys(Keys.CONTROL, Keys.RETURN)
-                        
-                    if hasattr(self, '_interaction_count'):
-                        self._interaction_count += 1
+                else:
+                    # Fallback directo a teclas de envío si no hay botón
+                    chat_input.send_keys(Keys.CONTROL, Keys.RETURN)
                 
                 self.logger.info(f"Mensaje enviado (intento {attempt+1})")
                 return
@@ -840,30 +519,16 @@ class DeepSeekClient:
             content=message
         )
 
-        full_response = ""          # Respuesta combinada del stream (puede incluir etiquetas visuales)
+        full_response = ""
         for chunk in self._wait_for_response(timeout):
             if stream_callback:
                 stream_callback(chunk)
             full_response += chunk
 
-        # FIX F3-01: pensamiento obtenido limpio del DOM (ya se mostró visualmente en stream).
         thinking = self._get_thinking_content()
 
-        # FIX F4-02: guardar en historial SOLO la respuesta pura, sin etiquetas Markdown del stream.
-        clean_response = full_response
-        separator = "\n\n\U0001f4a1 **Respuesta:**\n"
-        if separator in full_response:
-            clean_response = full_response.split(separator, 1)[-1]
-
-        # FIX F2-05: simular tiempo de lectura humana antes de continuar.
-        # simulate_reading_time estaba importada pero nunca llamada — ahora sí.
-        try:
-            simulate_reading_time(clean_response)
-        except Exception:
-            pass
-
         response = DeepSeekResponse(
-            content=clean_response,
+            content=full_response,
             model=self._current_model.value,
             state=ResponseState.COMPLETED,
             thinking=thinking,
@@ -872,7 +537,7 @@ class DeepSeekClient:
 
         self.history.current_conversation.add_message(
             role="assistant",
-            content=clean_response,
+            content=full_response,
             metadata={"thinking": thinking, "model": self._current_model.value}
         )
 
@@ -925,7 +590,6 @@ class DeepSeekClient:
             self.history.save_conversation()
  
         self.history.new_conversation()
-        self._interaction_count = 0  # <--- Resetear contador de Bypass JS (Fix 4)
  
         # Intentar encontrar botón de "New Chat" por heurística
         new_chat_btn = self._find_element_safe('new_chat_button', timeout=1) or \
@@ -1023,12 +687,6 @@ class DeepSeekClient:
                     file_input = self._find_element_safe('file_upload', timeout=3)
 
             if file_input:
-                # Desenmascarar el input si está oculto (común en apps web modernas)
-                self.driver.driver.execute_script(
-                    "arguments[0].style.display = 'block'; arguments[0].style.visibility = 'visible';", 
-                    file_input
-                )
-                time.sleep(0.2)
                 file_input.send_keys(file_path)
                 time.sleep(2)
                 return True
@@ -1076,12 +734,6 @@ class DeepSeekClient:
 
     def close(self):
         """Cierra el cliente y el navegador."""
-        try:
-            if hasattr(self, 'token_manager'):
-                self.token_manager.stop_monitoring()
-        except Exception:
-            pass
-
         # FIX 5: guards para __init__ parcialmente fallido
         try:
             if hasattr(self, 'history') and self.history.current_conversation.messages:
