@@ -79,7 +79,7 @@ class HardwareProfile:
     
     def _generate_user_agent(self) -> str:
         """Genera un user agent realista basado en el perfil."""
-        chrome_version = f"{random.randint(110, 120)}.0.{random.randint(5000, 6000)}.{random.randint(100, 200)}"
+        chrome_version = f"{random.randint(130, 145)}.0.{random.randint(6000, 7000)}.{random.randint(100, 250)}"
         
         if self.platform == "Win32":
             return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"

@@ -646,16 +646,23 @@ class DeepSeekClient:
             content=message
         )
 
-        full_response = ""
+        full_response = ""          # Respuesta combinada del stream (puede incluir etiquetas visuales)
         for chunk in self._wait_for_response(timeout):
             if stream_callback:
                 stream_callback(chunk)
             full_response += chunk
 
+        # FIX F3-01: pensamiento obtenido limpio del DOM (ya se mostró visualmente en stream).
         thinking = self._get_thinking_content()
 
+        # FIX F4-02: guardar en historial SOLO la respuesta pura, sin etiquetas Markdown del stream.
+        clean_response = full_response
+        separator = "\n\n\U0001f4a1 **Respuesta:**\n"
+        if separator in full_response:
+            clean_response = full_response.split(separator, 1)[-1]
+
         response = DeepSeekResponse(
-            content=full_response,
+            content=clean_response,
             model=self._current_model.value,
             state=ResponseState.COMPLETED,
             thinking=thinking,
@@ -664,7 +671,7 @@ class DeepSeekClient:
 
         self.history.current_conversation.add_message(
             role="assistant",
-            content=full_response,
+            content=clean_response,
             metadata={"thinking": thinking, "model": self._current_model.value}
         )
 

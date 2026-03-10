@@ -240,9 +240,7 @@ def _build_client(driver) -> DeepSeekClient:
         "x-client-version": "1.7.0",
         "x-client-platform": "web"
     }
-    client.saved_user_token = None
-    client.saved_waf_token = None
-    client.saved_smid_v2 = None
+    client._interaction_count = 0          # FIX F3-02: necesario para _send_message
     return client
 
 

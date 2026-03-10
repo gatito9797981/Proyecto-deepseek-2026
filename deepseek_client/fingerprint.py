@@ -780,7 +780,7 @@ class FingerprintGenerator:
                             'payment-handler','persistent-storage','accelerometer',
                             'gyroscope','magnetometer','screen-wake-lock','xr-spatial-tracking'
                         ];
-                        const state = prompted.includes(parameters.name) ? 'prompt' : 'prompt';
+                        const state = prompted.includes(parameters.name) ? 'prompt' : 'granted';
                         return Promise.resolve({
                             state: state, status: state, onchange: null,
                             addEventListener: function() {},
