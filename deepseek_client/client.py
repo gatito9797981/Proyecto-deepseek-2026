@@ -350,27 +350,47 @@ class DeepSeekClient:
 
     def _wait_for_response(self, timeout: float = None) -> Generator[str, None, None]:
         """
-        Espera la respuesta del modelo y la devuelve como stream.
+        Espera la respuesta del modelo y la devuelve como stream entrelazado.
 
         Yields:
-            str: Partes de la respuesta
+            str: Partes de la respuesta (pensamiento + texto final)
         """
         timeout = timeout or self.config.response_timeout
         start_time = time.time()
 
         last_content = ""
+        last_thinking = ""
         stable_count = 0
         last_growth_time = time.time()  # Track cuándo creció el contenido por última vez
+        has_emitted_thinking_header = False
+        has_emitted_response_header = False
 
         time.sleep(1.0)  # Esperar montaje inicial de React
 
         while time.time() - start_time < timeout:
             try:
+                thinking_content = self._get_thinking_content()
                 content = self._get_response_content()
                 is_gen = self._is_generating()
-
-                # Si el contenido creció, emitir y resetear todo
+                
+                # 1. Emitir Pensamientos primero (DeepThink)
+                if thinking_content and len(thinking_content) > len(last_thinking):
+                    if not has_emitted_thinking_header:
+                        yield "\n\n🤔 **Pensamiento de DeepSeek:**\n"
+                        has_emitted_thinking_header = True
+                        
+                    new_thinking = thinking_content[len(last_thinking):]
+                    yield new_thinking
+                    last_thinking = thinking_content
+                    stable_count = 0
+                    last_growth_time = time.time()
+                
+                # 2. Emitir Respuesta Final cuando empieza a poblarse
                 if content and len(content) > len(last_content):
+                    if not has_emitted_response_header:
+                        yield "\n\n💡 **Respuesta:**\n"
+                        has_emitted_response_header = True
+                        
                     new_content = content[len(last_content):]
                     yield new_content
                     last_content = content
@@ -380,16 +400,21 @@ class DeepSeekClient:
                 # Solo considerar "terminado" si:
                 # 1. JS dice que no genera
                 # 2. Contenido no creció en los últimos 4 segundos
-                # 3. stable_count acumuló suficiente
+                # 3. stable_count acumuló suficiente (3 ticks)
                 time_since_growth = time.time() - last_growth_time
                 
-                if not is_gen and content and time_since_growth > 4.0:
+                if not is_gen and (content or thinking_content) and time_since_growth > 4.0:
                     stable_count += 1
                     if stable_count >= 3:
-                        # Flush final
-                        final = self._get_response_content()
-                        if final and len(final) > len(last_content):
-                            yield final[len(last_content):]
+                        # Flush final por seguridad
+                        final_think = self._get_thinking_content()
+                        final_content = self._get_response_content()
+                        
+                        if final_think and len(final_think) > len(last_thinking):
+                            yield final_think[len(last_thinking):]
+                            
+                        if final_content and len(final_content) > len(last_content):
+                            yield final_content[len(last_content):]
                         return
                 else:
                     # Si sigue generando o creció recientemente, resetear stable
