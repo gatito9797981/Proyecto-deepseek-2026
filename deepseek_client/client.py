@@ -412,11 +412,18 @@ class DeepSeekClient:
         """Obtiene el contenido de la respuesta actual directamente en V8 (Zero-Latency)."""
         script = """
         try {
-            // Buscamos los bloques de mensaje (solo del asistente filtrando .ds-markdown o ignorando class="user")
-            let blocks = Array.from(document.querySelectorAll('.ds-markdown, div[class*="markdown"]'));
-            if (blocks.length > 0) {
-                // Tomar el texto del último mensaje del asistente
-                let lastBlock = blocks[blocks.length - 1];
+            // Buscamos todas las burbujas posibles del asistente
+            let allBlocks = Array.from(document.querySelectorAll('.ds-markdown, div[class*="markdown"]'));
+            if (allBlocks.length > 0) {
+                // Tomar el último gran bloque
+                let lastBlock = allBlocks[allBlocks.length - 1];
+                
+                // Si el bloque está dentro de DeepThink (.ds-think-content), significa que 
+                // aún no llega el markdown de respuesta real. Retornamos vacío.
+                if (lastBlock.closest('.ds-think-content') || lastBlock.closest('[class*="think"]')) {
+                    return "";
+                }
+                
                 return lastBlock.innerText || lastBlock.textContent || "";
             }
         } catch(e) {}
@@ -431,9 +438,10 @@ class DeepSeekClient:
         """Obtiene el contenido del 'pensamiento' (DeepThink R1) desde V8 (Zero-Latency)."""
         script = """
         try {
-            let blocks = Array.from(document.querySelectorAll('.ds-thought, [class*="think"]'));
-            if (blocks.length > 0) {
-                let lastBlock = blocks[blocks.length - 1];
+            // Extracción directa del contenedor especializado del pensamiento R1
+            let thinkBlocks = Array.from(document.querySelectorAll('.ds-think-content, [class*="think-content"]'));
+            if (thinkBlocks.length > 0) {
+                let lastBlock = thinkBlocks[thinkBlocks.length - 1];
                 return lastBlock.innerText || lastBlock.textContent || "";
             }
         } catch(e) {}
