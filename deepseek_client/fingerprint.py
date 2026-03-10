@@ -1,35 +1,30 @@
 """
 Módulo de fingerprinting para anti-detección avanzada.
 
-Este módulo genera scripts de JavaScript que se inyectan en el navegador
-para falsificar las huellas digitales del dispositivo, evitando la detección
-de automatización.
-
-Técnicas implementadas:
-    - WebDriver spoofing
-    - Canvas fingerprint con ruido determinista
-    - WebGL vendor/renderer falsos
-    - AudioContext noise injection
-    - Navigator properties spoofing
-    - Screen resolution spoofing
-    - WebRTC leak prevention
-    - Font fingerprint variation
-    - Permissions API spoofing
-    - Performance timing jitter
+Bugs corregidos respecto al original:
+  1. WebGL usaba getContext override por instancia → ahora parchea el prototipo.
+  2. Canvas doble ruido (toDataURL llama getImageData) → flag __fp_noised.
+  3. AudioContext doble ruido (createBuffer + getChannelData) → flag __fp_creating.
+  4. RTCPeerConnection función-wrapper rota → class extend.
+  5. Jitter performance.memory usaba Math.random() → valores deterministas.
+  6. Timezone getTimezoneOffset usaba getMonth() → puede llamar getter circular;
+     reemplazado por timestamps UTC precalculados.
+  7. Sin validación de level → ValueError temprano.
+  8. matchMedia override rompe media queries legítimas → eliminado.
 """
 
 import random
 import hashlib
 import json
-from typing import Dict, Any, Optional
-from dataclasses import dataclass
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass, field
 
 
 @dataclass
 class FingerprintConfig:
     """
     Configuración de fingerprint para un perfil específico.
-    
+
     Attributes:
         seed: Semilla para generar ruido determinista.
         webgl_vendor: Vendor de WebGL falsificado.
@@ -56,589 +51,597 @@ class FingerprintConfig:
     screen_height: int
     color_depth: int = 24
     timezone: str = "America/New_York"
-    languages: list = None
-    plugins: list = None
-    
-    def __post_init__(self):
-        if self.languages is None:
-            self.languages = ["en-US", "en"]
-        if self.plugins is None:
-            self.plugins = [
-                {"name": "Chrome PDF Plugin", "filename": "internal-pdf-viewer"},
-                {"name": "Chrome PDF Viewer", "filename": "mhjfbmdgcfjbbpaeojofohoefgiehjai"},
-                {"name": "Native Client", "filename": "internal-nacl-plugin"},
-            ]
+    # FIX: usar field() en lugar de None para evitar shared mutable defaults
+    languages: List[str] = field(default_factory=lambda: ["en-US", "en"])
+    plugins: List[dict] = field(default_factory=lambda: [
+        {"name": "Chrome PDF Plugin", "filename": "internal-pdf-viewer",
+         "description": "Portable Document Format"},
+        {"name": "Chrome PDF Viewer", "filename": "mhjfbmdgcfjbbpaeojofohoefgiehjai",
+         "description": ""},
+        {"name": "Native Client", "filename": "internal-nacl-plugin",
+         "description": ""},
+    ])
 
 
 class FingerprintGenerator:
     """
     Generador de scripts de fingerprinting para anti-detección.
-    
+
     Esta clase genera código JavaScript que se inyecta en el navegador
     para falsificar varias APIs y propiedades del dispositivo.
     """
-    
+
+    VALID_LEVELS = {"basic", "standard", "full"}
+
     def __init__(self, config: FingerprintConfig, level: str = "full"):
         """
         Inicializa el generador de fingerprinting.
-        
+
         Args:
             config: Configuración del fingerprint.
             level: Nivel de anti-detección (basic, standard, full).
         """
+        # FIX #7: validación temprana
+        if level not in self.VALID_LEVELS:
+            raise ValueError(
+                f"level debe ser uno de {self.VALID_LEVELS}, recibido: '{level}'"
+            )
         self.config = config
         self.level = level
         self._rng = random.Random(config.seed)
-    
+
     def _noise_value(self, base: float, variance: float = 0.1) -> float:
         """Genera un valor con ruido determinista basado en la semilla."""
         noise = self._rng.uniform(-variance, variance)
         return base + (base * noise)
-    
+
+    # ─────────────────────────────────────────────
+    # Compatibilidad: get_seed() para driver.py
+    # ─────────────────────────────────────────────
+
+    def get_seed(self) -> int:
+        return self.config.seed
+
     def generate_webdriver_script(self) -> str:
         """
-        Genera script para falsificar la propiedad navigator.webdriver.
-        
-        Returns:
-            str: Script JavaScript para inyección.
+        Falsifica navigator.webdriver, elimina variables ChromeDriver/Selenium
+        y protege la integridad de la prototype chain para evitar detección
+        via toString() o Symbol.toStringTag.
         """
         return """
-        // WebDriver Spoofing - Nivel máximo de ocultamiento
         (function() {
             'use strict';
             try {
-                // Eliminar propiedad webdriver completamente
-                delete Object.getPrototypeOf(navigator).webdriver;
-                
-                // Redefinir como undefined (no false, que es sospechoso)
+                // Eliminar del prototipo
+                try { delete Object.getPrototypeOf(navigator).webdriver; } catch(e) {}
+
                 Object.defineProperty(navigator, 'webdriver', {
                     get: function() { return undefined; },
                     configurable: true,
                     enumerable: true
                 });
-                
-                // Eliminar $cdc_ y $wdc_ variables usadas por ChromeDriver
-                delete window.$cdc_asdjflasutopfhvcZLmcfl_;
-                delete window.$cdc_;
-                delete window.$wdc_;
-                
-                // Eliminar __webdriver_script_fn
-                delete document.__webdriver_script_fn;
-                delete document.$cdc_asdjflasutopfhvcZLmcfl_;
-                
-                // Ocultar __selenium_evaluate, __selenium_unwrapped
-                delete document.__selenium_evaluate;
-                delete document.__selenium_unwrapped;
-                delete document.__webdriver_evaluate;
-                delete document.__webdriver_unwrapped;
-                delete document.__fxdriver_evaluate;
-                delete document.__fxdriver_unwrapped;
-                
-                // Eliminar __lastEvaluateTime
-                delete document.__lastEvaluateTime;
-                
-                // Limpiar funciones de Selenium - Desactivado por inestabilidad
-                
-                console.log('[Anti-Detection] WebDriver spoofing aplicado');
-            } catch (e) {
-                console.error('[Anti-Detection] Error en WebDriver spoofing:', e);
-            }
+
+                // Variables inyectadas por ChromeDriver/Selenium
+                ['$cdc_asdjflasutopfhvcZLmcfl_', '$cdc_', '$wdc_'].forEach(function(v) {
+                    try { delete window[v]; } catch(e) {}
+                });
+                [
+                    '__webdriver_script_fn', '$cdc_asdjflasutopfhvcZLmcfl_',
+                    '__selenium_evaluate', '__selenium_unwrapped',
+                    '__webdriver_evaluate', '__webdriver_unwrapped',
+                    '__fxdriver_evaluate', '__fxdriver_unwrapped',
+                    '__lastEvaluateTime'
+                ].forEach(function(v) { try { delete document[v]; } catch(e) {} });
+
+                // NUEVO: prototype chain integrity
+                // Los detectores llaman Function.prototype.toString en funciones
+                // nativas para ver si fueron reemplazadas. Parchamos toString
+                // para que funciones modificadas sigan pareciendo nativas.
+                const _nativeToString = Function.prototype.toString;
+                const _proxied = new WeakSet();
+
+                function _markNative(fn) {
+                    try { _proxied.add(fn); } catch(e) {}
+                    return fn;
+                }
+                window._fpMarkNative = _markNative;
+
+                Function.prototype.toString = function() {
+                    if (_proxied.has(this)) {
+                        return 'function ' + (this.name || '') + '() { [native code] }';
+                    }
+                    return _nativeToString.call(this);
+                };
+                // Marcar nuestro propio toString como nativo
+                _proxied.add(Function.prototype.toString);
+
+                // NUEVO: document.hasFocus y visibilityState
+                try {
+                    document.hasFocus = _markNative(function() { return true; });
+                    Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; }, configurable: true });
+                    Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
+                } catch(e) {}
+
+                // NUEVO: window.chrome.runtime más completo
+                window.chrome = window.chrome || {};
+                window.chrome.app = window.chrome.app || {};
+                window.chrome.runtime = window.chrome.runtime || {};
+                window.chrome.runtime.connect = _markNative(function() { return { postMessage: function(){}, disconnect: function(){}, onMessage: { addListener: function(){}, removeListener: function(){} } }; });
+                window.chrome.runtime.sendMessage = _markNative(function() {});
+                window.chrome.runtime.onMessage = { addListener: function(){}, removeListener: function(){} };
+                window.chrome.runtime.id = undefined;
+                window.chrome.loadTimes = _markNative(function() { return {}; });
+                window.chrome.csi = _markNative(function() { return { startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 15 }; });
+
+            } catch (e) {}
         })();
         """
-    
+
     def generate_canvas_script(self) -> str:
         """
-        Genera script para añadir ruido al canvas fingerprint.
-        
-        El ruido es determinista basado en la semilla, por lo que
-        siempre genera el mismo fingerprint para un mismo seed.
-        
-        Returns:
-            str: Script JavaScript para inyección.
+        Ruido determinista en canvas.
+        FIX #2: flag __fp_noised evita doble ruido cuando toDataURL llama getImageData.
+        Solo aplica a canvases pequeños (≤280x60) usados para fingerprinting.
         """
         seed = self.config.seed
         return f"""
-        // Canvas Fingerprint Spoofing con ruido determinista
         (function() {{
             'use strict';
             try {{
                 const SEED = {seed};
-                
-                // Generador de números pseudo-aleatorios determinista
-                function seededRandom(seed) {{
-                    const x = Math.sin(seed) * 10000;
+
+                function seededRandom(s) {{
+                    const x = Math.sin(s) * 10000;
                     return x - Math.floor(x);
                 }}
-                
-                // Función para añadir ruido sutil a los datos de imagen
-                function addNoiseToImageData(imageData) {{
+
+                // FIX #2: función de ruido centralizada
+                function addNoise(imageData) {{
                     const data = imageData.data;
-                    let noiseSeed = SEED;
-                    
+                    let ns = SEED;
                     for (let i = 0; i < data.length; i += 4) {{
-                        // Añadir ruido de ±1 a cada canal RGB (no alpha)
-                        noiseSeed += 1;
-                        const noise = Math.floor(seededRandom(noiseSeed) * 3) - 1;
-                        data[i] = Math.max(0, Math.min(255, data[i] + noise));     // R
-                        data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + noise)); // G
-                        data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + noise)); // B
-                        // Alpha (data[i + 3]) sin modificar
+                        ns += 1;
+                        const noise = Math.floor(seededRandom(ns) * 3) - 1;
+                        data[i]   = Math.max(0, Math.min(255, data[i]   + noise));
+                        data[i+1] = Math.max(0, Math.min(255, data[i+1] + noise));
+                        data[i+2] = Math.max(0, Math.min(255, data[i+2] + noise));
                     }}
                     return imageData;
                 }}
-                
-                // Override toDataURL
-                const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+
+                const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+                const _origToDataURL    = HTMLCanvasElement.prototype.toDataURL;
+                const _origToBlob       = HTMLCanvasElement.prototype.toBlob;
+
+                // toDataURL: aplica ruido y marca flag para que getImageData no lo duplique
                 HTMLCanvasElement.prototype.toDataURL = function(type) {{
-                    try {{
-                        // Solo añadir ruido a canvas pequeños (fingerprinting)
-                        if (this.width <= 280 && this.height <= 60) {{
-                            const ctx = this.getContext('2d');
-                            if (ctx) {{
-                                const imageData = ctx.getImageData(0, 0, this.width, this.height);
-                                const noisyData = addNoiseToImageData(imageData);
-                                ctx.putImageData(noisyData, 0, 0);
+                    if (this.width <= 280 && this.height <= 60) {{
+                        const ctx = this.getContext('2d');
+                        if (ctx && !this.__fp_noised) {{
+                            try {{
+                                this.__fp_noised = true;
+                                const img = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
+                                addNoise(img);
+                                ctx.putImageData(img, 0, 0);
+                            }} catch(e) {{}} finally {{
+                                this.__fp_noised = false;
                             }}
                         }}
-                    }} catch (e) {{
-                        // Canvas tainted o contexto no disponible
                     }}
-                    return originalToDataURL.apply(this, arguments);
+                    return _origToDataURL.apply(this, arguments);
                 }};
-                
-                // Override toBlob
-                const originalToBlob = HTMLCanvasElement.prototype.toBlob;
+
+                // toBlob: mismo patrón
                 HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {{
-                    try {{
-                        if (this.width <= 280 && this.height <= 60) {{
-                            const ctx = this.getContext('2d');
-                            if (ctx) {{
-                                const imageData = ctx.getImageData(0, 0, this.width, this.height);
-                                const noisyData = addNoiseToImageData(imageData);
-                                ctx.putImageData(noisyData, 0, 0);
+                    if (this.width <= 280 && this.height <= 60) {{
+                        const ctx = this.getContext('2d');
+                        if (ctx && !this.__fp_noised) {{
+                            try {{
+                                this.__fp_noised = true;
+                                const img = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
+                                addNoise(img);
+                                ctx.putImageData(img, 0, 0);
+                            }} catch(e) {{}} finally {{
+                                this.__fp_noised = false;
                             }}
                         }}
-                    }} catch (e) {{}}
-                    return originalToBlob.apply(this, arguments);
-                }};
-                
-                // Override getImageData
-                const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-                CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {{
-                    const imageData = originalGetImageData.apply(this, arguments);
-                    
-                    // Solo añadir ruido a canvas pequeños
-                    if (sw <= 280 && sh <= 60) {{
-                        return addNoiseToImageData(imageData);
                     }}
-                    return imageData;
+                    return _origToBlob.apply(this, arguments);
                 }};
-                
-                console.log('[Anti-Detection] Canvas fingerprint spoofing aplicado');
+
+                // getImageData: ruido solo si NO estamos dentro de toDataURL/toBlob
+                CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {{
+                    const result = _origGetImageData.apply(this, arguments);
+                    if (this.canvas && this.canvas.__fp_noised) return result;
+                    if (sw <= 280 && sh <= 60) addNoise(result);
+                    return result;
+                }};
+
             }} catch (e) {{
-                console.error('[Anti-Detection] Error en Canvas spoofing:', e);
+
             }}
         }})();
         """
-    
+
     def generate_webgl_script(self) -> str:
         """
-        Genera script para falsificar información de WebGL.
-        
-        Returns:
-            str: Script JavaScript para inyección.
+        FIX #1: parchea el prototipo directamente en lugar de hacer override
+        de getContext por instancia (que era detectable y menos robusto).
+        Incluye mapa de constantes WebGL reales en lugar de índice consecutivo.
         """
-        vendor = self.config.webgl_vendor
+        vendor   = self.config.webgl_vendor
         renderer = self.config.webgl_renderer
-        
+
+        # Mapa de constantes WebGL reales → valores spoofed
+        webgl_params = {
+            0x0D33: 16384,   # MAX_TEXTURE_SIZE
+            0x84E8: 16384,   # MAX_RENDERBUFFER_SIZE
+            0x8869: 16,      # MAX_VERTEX_ATTRIBS
+            0x8B4A: 4096,    # MAX_VERTEX_UNIFORM_VECTORS
+            0x8B49: 1024,    # MAX_FRAGMENT_UNIFORM_VECTORS
+            0x8B4C: 16,      # MAX_VERTEX_TEXTURE_IMAGE_UNITS
+            0x8B4D: 32,      # MAX_COMBINED_TEXTURE_IMAGE_UNITS
+            0x8872: 16,      # MAX_TEXTURE_IMAGE_UNITS
+            0x851C: 16384,   # MAX_CUBE_MAP_TEXTURE_SIZE
+            0x8D57: 4,       # MAX_SAMPLES
+            0x8CDF: 8,       # MAX_COLOR_ATTACHMENTS
+            0x8824: 8,       # MAX_DRAW_BUFFERS
+            # NUEVO: WebGL2 parámetros extendidos
+            0x806F: 256,     # MAX_3D_TEXTURE_SIZE
+            0x8073: 256,     # MAX_ARRAY_TEXTURE_LAYERS
+            0x8A2B: 14,      # MAX_VERTEX_UNIFORM_BLOCKS
+            0x8A2D: 14,      # MAX_FRAGMENT_UNIFORM_BLOCKS
+            0x8A2E: 28,      # MAX_COMBINED_UNIFORM_BLOCKS
+            0x8A2F: 72,      # MAX_UNIFORM_BUFFER_BINDINGS
+            0x8A30: 65536,   # MAX_UNIFORM_BLOCK_SIZE
+            0x8E82: 4,       # MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
+        }
+        params_js = json.dumps({str(k): v for k, v in webgl_params.items()})
+
         return f"""
-        // WebGL Fingerprint Spoofing
         (function() {{
             'use strict';
             try {{
-                const FAKE_VENDOR = '{vendor}';
-                const FAKE_RENDERER = '{renderer}';
-                
-                // Función para obtener contexto WebGL original
-                function getOriginalGetContext() {{
-                    return HTMLCanvasElement.prototype.getContext;
-                }}
-                
-                // Override getContext para interceptar WebGL
-                const originalGetContext = HTMLCanvasElement.prototype.getContext;
-                HTMLCanvasElement.prototype.getContext = function(type, attributes) {{
-                    const context = originalGetContext.call(this, type, attributes);
-                    
-                    if (context && (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl')) {{
-                        // Override getParameter
-                        const originalGetParameter = context.getParameter.bind(context);
-                        context.getParameter = function(parameter) {{
-                            // UNMASKED_VENDOR_WEBGL
-                            if (parameter === 0x9245 || parameter === 37445) {{
-                                return FAKE_VENDOR;
+                const VENDOR   = '{vendor}';
+                const RENDERER = '{renderer}';
+                const PARAMS   = {params_js};
+
+                function patchWebGL(ctx) {{
+                    if (!ctx || !ctx.prototype) return;
+
+                    const _origGP = ctx.prototype.getParameter;
+                    ctx.prototype.getParameter = function(parameter) {{
+                        if (parameter === 37445 || parameter === 0x9245) return VENDOR;
+                        if (parameter === 37446 || parameter === 0x9246) return RENDERER;
+                        if (parameter === 0x1F02) return 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
+                        if (parameter === 0x8B8C) return 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
+                        if (parameter === 0x1F00) return 'Google Inc.';
+                        const key = String(parameter);
+                        if (PARAMS.hasOwnProperty(key)) return PARAMS[key];
+                        return _origGP.apply(this, arguments);
+                    }};
+
+                    const _origGE = ctx.prototype.getExtension;
+                    ctx.prototype.getExtension = function(name) {{
+                        if (name === 'WEBGL_debug_renderer_info') {{
+                            return {{ UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 }};
+                        }}
+                        return _origGE.apply(this, arguments);
+                    }};
+
+                    const _origGSE = ctx.prototype.getSupportedExtensions;
+                    ctx.prototype.getSupportedExtensions = function() {{
+                        const exts = _origGSE.apply(this, arguments) || [];
+                        return exts.filter(function(e) {{ return !e.includes('debug'); }});
+                    }};
+
+                    // NUEVO: getShaderPrecisionFormat — usado para GPU fingerprinting
+                    if (ctx.prototype.getShaderPrecisionFormat) {{
+                        const _origGSPF = ctx.prototype.getShaderPrecisionFormat;
+                        ctx.prototype.getShaderPrecisionFormat = function(shaderType, precisionType) {{
+                            const result = _origGSPF.apply(this, arguments);
+                            // Devolver valores estándar consistentes para evitar fingerprint por precisión GPU
+                            if (result) {{
+                                return {{ rangeMin: 127, rangeMax: 127, precision: 23 }};
                             }}
-                            // UNMASKED_RENDERER_WEBGL
-                            if (parameter === 0x9246 || parameter === 37446) {{
-                                return FAKE_RENDERER;
-                            }}
-                            // VERSION
-                            if (parameter === 0x1F02) {{
-                                return 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
-                            }}
-                            // SHADING_LANGUAGE_VERSION
-                            if (parameter === 0x8B8C) {{
-                                return 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
-                            }}
-                            // VENDOR
-                            if (parameter === 0x1F00) {{
-                                return 'Google Inc. (NVIDIA)';
-                            }}
-                            return originalGetParameter(parameter);
-                        }};
-                        
-                        // Override getExtension para no exponer extensiones sospechosas
-                        const originalGetExtension = context.getExtension.bind(context);
-                        context.getExtension = function(name) {{
-                            // Bloquear extensiones que podrían revelar información
-                            if (name === 'WEBGL_debug_renderer_info') {{
-                                return {{
-                                    UNMASKED_VENDOR_WEBGL: 0x9245,
-                                    UNMASKED_RENDERER_WEBGL: 0x9246
-                                }};
-                            }}
-                            return originalGetExtension(name);
-                        }};
-                        
-                        // Override getSupportedExtensions
-                        const originalGetSupportedExtensions = context.getSupportedExtensions.bind(context);
-                        context.getSupportedExtensions = function() {{
-                            const extensions = originalGetSupportedExtensions() || [];
-                            // Filtrar extensiones que podrían ser usadas para fingerprinting
-                            return extensions.filter(ext => !ext.includes('debug'));
+                            return result;
                         }};
                     }}
-                    
-                    return context;
-                }};
-                
-                console.log('[Anti-Detection] WebGL spoofing aplicado');
-            }} catch (e) {{
-                console.error('[Anti-Detection] Error en WebGL spoofing:', e);
-            }}
+                }}
+
+                if (typeof WebGLRenderingContext  !== 'undefined') patchWebGL(WebGLRenderingContext);
+                if (typeof WebGL2RenderingContext !== 'undefined') patchWebGL(WebGL2RenderingContext);
+
+                // NUEVO: OffscreenCanvas — misma cobertura que Canvas normal
+                if (typeof OffscreenCanvas !== 'undefined') {{
+                    try {{
+                        const _origOCGetContext = OffscreenCanvas.prototype.getContext;
+                        OffscreenCanvas.prototype.getContext = function(type, attrs) {{
+                            const ctx = _origOCGetContext.apply(this, arguments);
+                            if (ctx && (type === 'webgl' || type === 'webgl2')) {{
+                                patchWebGL(ctx.constructor);
+                            }}
+                            return ctx;
+                        }};
+                    }} catch(e) {{}}
+                }}
+
+            }} catch (e) {{}}
         }})();
         """
-    
+
     def generate_audio_script(self) -> str:
         """
-        Genera script para añadir ruido al AudioContext fingerprint.
-        
-        Returns:
-            str: Script JavaScript para inyección.
+        FIX #3: flag __fp_creating evita doble ruido entre createBuffer y getChannelData.
+        Incluye OfflineAudioContext, createOscillator y createDynamicsCompressor.
         """
         seed = self.config.seed
         return f"""
-        // AudioContext Fingerprint Spoofing
         (function() {{
             'use strict';
             try {{
                 const SEED = {seed};
-                
-                function seededRandom(seed) {{
-                    const x = Math.sin(seed) * 10000;
+
+                function seededRandom(s) {{
+                    const x = Math.sin(s) * 10000;
                     return x - Math.floor(x);
                 }}
-                
-                // Override AudioContext
-                const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
-                if (OriginalAudioContext) {{
-                    const NewAudioContext = function(contextOptions) {{
-                        const ctx = new OriginalAudioContext(contextOptions);
-                        
-                        // Override createOscillator
-                        const originalCreateOscillator = ctx.createOscillator.bind(ctx);
-                        ctx.createOscillator = function() {{
-                            const oscillator = originalCreateOscillator();
-                            // Añadir pequeña variación en la frecuencia
-                            const originalFrequency = oscillator.frequency;
-                            const originalSetValueAtTime = originalFrequency.setValueAtTime.bind(originalFrequency);
-                            originalFrequency.setValueAtTime = function(value, startTime) {{
-                                const noise = seededRandom(SEED + startTime * 1000) * 0.0001 - 0.00005;
-                                return originalSetValueAtTime(value * (1 + noise), startTime);
-                            }};
-                            return oscillator;
-                        }};
-                        
-                        // Override createDynamicsCompressor
-                        const originalCreateDynamicsCompressor = ctx.createDynamicsCompressor.bind(ctx);
-                        ctx.createDynamicsCompressor = function() {{
-                            const compressor = originalCreateDynamicsCompressor();
-                            // Añadir pequeña variación en los parámetros
-                            const noise = seededRandom(SEED);
-                            compressor.threshold.value += noise * 0.1;
-                            compressor.knee.value += noise * 0.1;
-                            compressor.ratio.value += noise * 0.01;
-                            return compressor;
-                        }};
-                        
-                        // Override createAnalyser
-                        const originalCreateAnalyser = ctx.createAnalyser.bind(ctx);
-                        ctx.createAnalyser = function() {{
-                            const analyser = originalCreateAnalyser();
-                            const originalGetFloatFrequencyData = analyser.getFloatFrequencyData.bind(analyser);
-                            analyser.getFloatFrequencyData = function(array) {{
-                                originalGetFloatFrequencyData(array);
-                                // Añadir ruido sutil a los datos
-                                for (let i = 0; i < array.length; i++) {{
-                                    array[i] += seededRandom(SEED + i) * 0.001 - 0.0005;
-                                }}
-                            }};
-                            return analyser;
-                        }};
-                        
-                        return ctx;
+
+                // getChannelData con ruido, respeta flag __fp_creating
+                if (typeof AudioBuffer !== 'undefined' && AudioBuffer.prototype) {{
+                    const _origGCD = AudioBuffer.prototype.getChannelData;
+                    AudioBuffer.prototype.getChannelData = function(channel) {{
+                        const data = _origGCD.call(this, channel);
+                        if (!this.__fp_creating) {{
+                            for (let i = 0; i < data.length; i++) {{
+                                data[i] += seededRandom(SEED + i + (channel||0) * 10000) * 0.0002 - 0.0001;
+                            }}
+                        }}
+                        return data;
                     }};
-                    
-                    // Copiar prototipo y propiedades estáticas
-                    NewAudioContext.prototype = OriginalAudioContext.prototype;
-                    Object.setPrototypeOf(NewAudioContext, OriginalAudioContext);
-                    
-                    // Reemplazar en window
-                    if (window.AudioContext) window.AudioContext = NewAudioContext;
-                    if (window.webkitAudioContext) window.webkitAudioContext = NewAudioContext;
                 }}
-                
-                // Override OfflineAudioContext
-                if (window.OfflineAudioContext) {{
-                    const OriginalOfflineAudioContext = window.OfflineAudioContext;
-                    const NewOfflineAudioContext = function(numberOfChannels, length, sampleRate) {{
-                        const ctx = new OriginalOfflineAudioContext(numberOfChannels, length, sampleRate);
-                        
-                        // Override startRendering
-                        const originalStartRendering = ctx.startRendering.bind(ctx);
-                        ctx.startRendering = function() {{
-                            const promise = originalStartRendering();
-                            return promise.then(buffer => {{
-                                // Añadir ruido sutil al buffer
-                                for (let channel = 0; channel < buffer.numberOfChannels; channel++) {{
-                                    const data = buffer.getChannelData(channel);
-                                    for (let i = 0; i < data.length; i++) {{
-                                        data[i] += seededRandom(SEED + i + channel * 10000) * 0.00001 - 0.000005;
-                                    }}
-                                }}
-                                return buffer;
-                            }});
-                        }};
-                        
-                        return ctx;
+
+                if (typeof AudioContext !== 'undefined' && AudioContext.prototype) {{
+                    // FIX #3: createBuffer marca buffer para evitar doble ruido
+                    const _origCB = AudioContext.prototype.createBuffer;
+                    AudioContext.prototype.createBuffer = function(ch, len, sr) {{
+                        const buf = _origCB.apply(this, arguments);
+                        buf.__fp_creating = true;
+                        for (let c = 0; c < ch; c++) {{
+                            const d = buf.getChannelData(c);
+                            for (let i = 0; i < d.length; i++) {{
+                                d[i] += seededRandom(SEED + i + c * 10000) * 0.0001 - 0.00005;
+                            }}
+                        }}
+                        buf.__fp_creating = false;
+                        return buf;
                     }};
-                    
-                    NewOfflineAudioContext.prototype = OriginalOfflineAudioContext.prototype;
-                    window.OfflineAudioContext = NewOfflineAudioContext;
+
+                    // createOscillator: variación de frecuencia
+                    const _origCO = AudioContext.prototype.createOscillator;
+                    AudioContext.prototype.createOscillator = function() {{
+                        const osc = _origCO.apply(this, arguments);
+                        const _sv = osc.frequency.setValueAtTime.bind(osc.frequency);
+                        osc.frequency.setValueAtTime = function(value, startTime) {{
+                            const noise = seededRandom(SEED + startTime * 1000) * 0.0001 - 0.00005;
+                            return _sv(value * (1 + noise), startTime);
+                        }};
+                        return osc;
+                    }};
+
+                    // createDynamicsCompressor: variación en parámetros
+                    const _origCDC = AudioContext.prototype.createDynamicsCompressor;
+                    AudioContext.prototype.createDynamicsCompressor = function() {{
+                        const comp = _origCDC.apply(this, arguments);
+                        const noise = seededRandom(SEED);
+                        comp.threshold.value += noise * 0.1;
+                        comp.knee.value      += noise * 0.1;
+                        comp.ratio.value     += noise * 0.01;
+                        return comp;
+                    }};
                 }}
-                
-                console.log('[Anti-Detection] AudioContext spoofing aplicado');
+
+                // OfflineAudioContext: ruido en buffer final
+                if (typeof OfflineAudioContext !== 'undefined' && OfflineAudioContext.prototype) {{
+                    const _origSR = OfflineAudioContext.prototype.startRendering;
+                    OfflineAudioContext.prototype.startRendering = function() {{
+                        return _origSR.apply(this, arguments).then(function(buffer) {{
+                            for (let ch = 0; ch < buffer.numberOfChannels; ch++) {{
+                                const data = buffer.getChannelData(ch);
+                                for (let i = 0; i < data.length; i++) {{
+                                    data[i] += seededRandom(SEED + i + ch * 10000) * 0.00001 - 0.000005;
+                                }}
+                            }}
+                            return buffer;
+                        }});
+                    }};
+                }}
+
             }} catch (e) {{
-                console.error('[Anti-Detection] Error en Audio spoofing:', e);
+
             }}
         }})();
         """
-    
+
     def generate_navigator_script(self) -> str:
-        """
-        Genera script para falsificar propiedades del navigator.
-        
-        Returns:
-            str: Script JavaScript para inyección.
-        """
+        """Falsifica propiedades del navigator incluyendo plugins y mimeTypes."""
+        ua = self.config.user_agent
+        app_version = ua.split("Mozilla/")[1] if "Mozilla/" in ua else "5.0"
         return f"""
-        // Navigator Properties Spoofing
         (function() {{
             'use strict';
             try {{
-                const navigatorProps = {{
+                const props = {{
                     hardwareConcurrency: {self.config.hardware_concurrency},
-                    deviceMemory: {self.config.device_memory},
-                    platform: '{self.config.platform}',
-                    vendor: 'Google Inc.',
-                    vendorSub: '',
-                    productSub: '20030107',
-                    cookieEnabled: true,
-                    doNotTrack: null,
-                    maxTouchPoints: 0,
-                    appCodeName: 'Mozilla',
-                    appName: 'Netscape',
-                    appVersion: '{self.config.user_agent.split("Mozilla/")[1] if "Mozilla/" in self.config.user_agent else "5.0"}',
-                    oscpu: undefined,
-                    buildID: undefined,
-                    product: 'Gecko',
-                    pdfViewerEnabled: true,
-                    languages: {json.dumps(self.config.languages)},
-                    language: '{self.config.languages[0] if self.config.languages else "en-US"}',
-                    onLine: true
+                    deviceMemory:        {self.config.device_memory},
+                    platform:            '{self.config.platform}',
+                    vendor:              'Google Inc.',
+                    vendorSub:           '',
+                    productSub:          '20030107',
+                    cookieEnabled:       true,
+                    doNotTrack:          null,
+                    maxTouchPoints:      0,
+                    appCodeName:         'Mozilla',
+                    appName:             'Netscape',
+                    appVersion:          '{app_version}',
+                    product:             'Gecko',
+                    pdfViewerEnabled:    true,
+                    languages:           {json.dumps(self.config.languages)},
+                    language:            '{self.config.languages[0] if self.config.languages else "en-US"}',
+                    onLine:              true
                 }};
-                
-                // Aplicar cada propiedad
-                for (const [prop, value] of Object.entries(navigatorProps)) {{
+
+                for (const [prop, value] of Object.entries(props)) {{
                     try {{
                         Object.defineProperty(navigator, prop, {{
                             get: function() {{ return value; }},
-                            configurable: true,
-                            enumerable: true
+                            configurable: true, enumerable: true
                         }});
-                    }} catch (e) {{
-                        // Algunas propiedades pueden no ser configurables
-                    }}
+                    }} catch (e) {{}}
                 }}
-                
-                // Override plugins
-                const pluginsArray = {json.dumps(self.config.plugins)};
+
+                // Plugins
+                const pluginsData = {json.dumps(self.config.plugins)};
                 const pluginArray = {{
-                    length: pluginsArray.length,
-                    item: function(index) {{
-                        return this[index] || null;
-                    }},
-                    namedItem: function(name) {{
+                    length: pluginsData.length,
+                    item: function(i) {{ return this[i] || null; }},
+                    namedItem: function(n) {{
                         for (let i = 0; i < this.length; i++) {{
-                            if (this[i].name === name) return this[i];
+                            if (this[i].name === n) return this[i];
                         }}
                         return null;
                     }},
-                    refresh: function() {{}},
-                    ...Object.fromEntries(pluginsArray.map((p, i) => [i, {{
-                        name: p.name,
-                        filename: p.filename,
-                        description: p.name,
+                    refresh: function() {{}}
+                }};
+                pluginsData.forEach(function(p, i) {{
+                    pluginArray[i] = {{
+                        name: p.name, filename: p.filename,
+                        description: p.description || p.name,
                         length: 1,
                         item: function() {{ return {{}}; }},
                         namedItem: function() {{ return {{}}; }}
-                    }}]))
-                }};
-                
+                    }};
+                }});
                 Object.defineProperty(navigator, 'plugins', {{
                     get: function() {{ return pluginArray; }},
-                    configurable: true,
-                    enumerable: true
+                    configurable: true, enumerable: true
                 }});
-                
-                // Override mimeTypes
-                const mimeTypes = {{
+
+                // mimeTypes
+                const mimeTypesData = {{
                     'application/pdf': {{
-                        description: 'Portable Document Format',
-                        suffixes: 'pdf',
-                        type: 'application/pdf',
-                        enabledPlugin: pluginArray[0]
+                        description: 'Portable Document Format', suffixes: 'pdf',
+                        type: 'application/pdf', enabledPlugin: pluginArray[0]
                     }},
                     'application/x-google-chrome-pdf': {{
-                        description: 'Portable Document Format',
-                        suffixes: 'pdf',
-                        type: 'application/x-google-chrome-pdf',
-                        enabledPlugin: pluginArray[0]
+                        description: 'Portable Document Format', suffixes: 'pdf',
+                        type: 'application/x-google-chrome-pdf', enabledPlugin: pluginArray[0]
                     }}
                 }};
-                
                 Object.defineProperty(navigator, 'mimeTypes', {{
                     get: function() {{
                         return {{
-                            length: Object.keys(mimeTypes).length,
-                            item: function(index) {{
-                                return Object.values(mimeTypes)[index] || null;
-                            }},
-                            namedItem: function(name) {{
-                                return mimeTypes[name] || null;
-                            }},
-                            ...mimeTypes
+                            length: Object.keys(mimeTypesData).length,
+                            item: function(i) {{ return Object.values(mimeTypesData)[i] || null; }},
+                            namedItem: function(n) {{ return mimeTypesData[n] || null; }},
+                            ...mimeTypesData
                         }};
                     }},
-                    configurable: true,
-                    enumerable: true
+                    configurable: true, enumerable: true
                 }});
-                
-                // Override getBattery
+
+                // getBattery
                 if (navigator.getBattery) {{
                     Object.defineProperty(navigator, 'getBattery', {{
                         value: function() {{
                             return Promise.resolve({{
-                                charging: true,
-                                chargingTime: 0,
-                                dischargingTime: Infinity,
-                                level: 1.0,
-                                onchargingchange: null,
-                                onchargingtimechange: null,
-                                ondischargingtimechange: null,
-                                onlevelchange: null
+                                charging: true, chargingTime: 0,
+                                dischargingTime: Infinity, level: 0.92,
+                                onchargingchange: null, onchargingtimechange: null,
+                                ondischargingtimechange: null, onlevelchange: null,
+                                addEventListener: function() {{}}, removeEventListener: function() {{}}
                             }});
                         }},
-                        configurable: true,
-                        writable: true
+                        configurable: true, writable: true
                     }});
                 }}
-                
-                // Override getConnection
-                if (navigator.connection) {{
-                    Object.defineProperty(navigator.connection, 'rtt', {{
-                        get: function() {{ return 50 + Math.floor(Math.random() * 50); }},
-                        configurable: true
+
+                // connection completo
+                try {{
+                    const _conn = {{
+                        rtt: 50, downlink: 10, effectiveType: '4g',
+                        saveData: false, type: 'wifi', onchange: null,
+                        addEventListener: function() {{}}, removeEventListener: function() {{}}
+                    }};
+                    Object.defineProperty(navigator, 'connection', {{
+                        get: function() {{ return _conn; }}, configurable: true
                     }});
-                }}
-                
-                console.log('[Anti-Detection] Navigator spoofing aplicado');
-            }} catch (e) {{
-                console.error('[Anti-Detection] Error en Navigator spoofing:', e);
-            }}
+                }} catch(e) {{}}
+
+                // NUEVO: speechSynthesis con voces realistas (vacía = detectable)
+                try {{
+                    const _voices = [
+                        {{ voiceURI: 'Google US English', name: 'Google US English', lang: 'en-US', localService: false, default: true }},
+                        {{ voiceURI: 'Google UK English Female', name: 'Google UK English Female', lang: 'en-GB', localService: false, default: false }},
+                        {{ voiceURI: 'Google español', name: 'Google español', lang: 'es-ES', localService: false, default: false }},
+                    ];
+                    if (!window.speechSynthesis) {{
+                        window.speechSynthesis = {{
+                            pending: false, speaking: false, paused: false,
+                            onvoiceschanged: null,
+                            getVoices: function() {{ return _voices; }},
+                            speak: function() {{}}, cancel: function() {{}},
+                            pause: function() {{}}, resume: function() {{}}
+                        }};
+                    }} else {{
+                        const _origGV = window.speechSynthesis.getVoices.bind(window.speechSynthesis);
+                        window.speechSynthesis.getVoices = function() {{
+                            const real = _origGV();
+                            return real.length > 0 ? real : _voices;
+                        }};
+                    }}
+                }} catch(e) {{}}
+
+                // NUEVO: history.length > 0 (siempre 0 en bot = detectable)
+                try {{
+                    Object.defineProperty(window.history, 'length', {{
+                        get: function() {{ return 3; }}, configurable: true
+                    }});
+                }} catch(e) {{}}
+
+            }} catch (e) {{}}
         }})();
         """
-    
+
     def generate_screen_script(self) -> str:
-        """
-        Genera script para falsificar información de pantalla.
-        
-        Returns:
-            str: Script JavaScript para inyección.
-        """
+        """Falsifica resolución de pantalla y devicePixelRatio."""
+        w = self.config.screen_width
+        h = self.config.screen_height
+        cd = self.config.color_depth
         return f"""
-        // Screen Properties Spoofing
         (function() {{
             'use strict';
             try {{
-                const screenProps = {{
-                    width: {self.config.screen_width},
-                    height: {self.config.screen_height},
-                    availWidth: {self.config.screen_width},
-                    availHeight: {self.config.screen_height} - 40,  // Taskbar
-                    colorDepth: {self.config.color_depth},
-                    pixelDepth: {self.config.color_depth},
-                    top: 0,
-                    left: 0,
-                    availTop: 0,
-                    availLeft: 0,
-                    orientation: {{
-                        type: 'landscape-primary',
-                        angle: 0,
-                        onchange: null
-                    }},
-                    devicePixelRatio: 1
-                }};
-                
-                // Aplicar a screen
-                for (const [prop, value] of Object.entries(screenProps)) {{
-                    if (prop === 'orientation' || prop === 'devicePixelRatio') continue;
+                const _screenProps = [
+                    ['width', {w}], ['height', {h}],
+                    ['availWidth', {w}], ['availHeight', {h} - 40],
+                    ['colorDepth', {cd}], ['pixelDepth', {cd}],
+                    ['top', 0], ['left', 0], ['availTop', 0], ['availLeft', 0]
+                ];
+                _screenProps.forEach(function(pair) {{
                     try {{
-                        Object.defineProperty(screen, prop, {{
-                            get: function() {{ return value; }},
-                            configurable: true,
-                            enumerable: true
+                        Object.defineProperty(screen, pair[0], {{
+                            get: function() {{ return pair[1]; }},
+                            configurable: true, enumerable: true
                         }});
-                    }} catch (e) {{}}
-                }}
-                
-                // Override orientation
+                    }} catch(e) {{}}
+                }});
+
                 try {{
                     Object.defineProperty(screen, 'orientation', {{
                         get: function() {{
                             return {{
-                                type: 'landscape-primary',
-                                angle: 0,
-                                onchange: null,
+                                type: 'landscape-primary', angle: 0, onchange: null,
                                 addEventListener: function() {{}},
                                 removeEventListener: function() {{}},
                                 dispatchEvent: function() {{ return true; }}
@@ -646,15 +649,277 @@ class FingerprintGenerator:
                         }},
                         configurable: true
                     }});
-                }} catch (e) {{}}
-                
-                // Override window.devicePixelRatio
+                }} catch(e) {{}}
+
                 Object.defineProperty(window, 'devicePixelRatio', {{
-                    get: function() {{ return 1; }},
-                    configurable: true
+                    get: function() {{ return 1; }}, configurable: true
                 }});
-                
-                // Override outerWidth/outerHeight
+                Object.defineProperty(window, 'outerWidth', {{
+                    get: function() {{ return {w}; }}, configurable: true
+                }});
+                Object.defineProperty(window, 'outerHeight', {{
+                    get: function() {{ return {h} - 40; }}, configurable: true
+                }});
+
+            }} catch (e) {{
+
+            }}
+        }})();
+        """
+
+    def generate_webrtc_script(self) -> str:
+        """
+        FIX #4: usa class extend en lugar de función-wrapper para RTCPeerConnection.
+        Preserva instanceof y propiedades estáticas correctamente.
+        Incluye SDP leak prevention.
+        """
+        return """
+        (function() {
+            'use strict';
+            try {
+                const OrigRTC = window.RTCPeerConnection
+                             || window.webkitRTCPeerConnection
+                             || window.mozRTCPeerConnection;
+                if (!OrigRTC) return;
+
+                // FIX #4: class extend preserva instanceof y propiedades estáticas
+                class PatchedRTC extends OrigRTC {
+                    constructor(config, constraints) {
+                        const patched = Object.assign({}, config || {}, { iceServers: [] });
+                        super(patched, constraints);
+                    }
+                }
+
+                // SDP leak prevention
+                const _origCreateOffer = PatchedRTC.prototype.createOffer;
+                PatchedRTC.prototype.createOffer = function(options) {
+                    return _origCreateOffer.call(this, options).then(function(offer) {
+                        if (offer && offer.sdp) {
+                            offer.sdp = offer.sdp.replace(/\r\na=candidate:.*/g, '');
+                        }
+                        return offer;
+                    });
+                };
+
+                window.RTCPeerConnection       = PatchedRTC;
+                window.webkitRTCPeerConnection = PatchedRTC;
+                window.mozRTCPeerConnection    = PatchedRTC;
+
+            } catch (e) {
+
+            }
+        })();
+        """
+
+    def generate_font_script(self) -> str:
+        """Ruido determinista en measureText y variación en offsetWidth/Height."""
+        seed = self.config.seed
+        return f"""
+        (function() {{
+            'use strict';
+            try {{
+                const SEED = {seed};
+                function seededRandom(s) {{
+                    const x = Math.sin(s) * 10000;
+                    return x - Math.floor(x);
+                }}
+
+                // measureText con ruido determinista por seed
+                const _origMT = CanvasRenderingContext2D.prototype.measureText;
+                CanvasRenderingContext2D.prototype.measureText = function(text) {{
+                    const m = _origMT.call(this, text);
+                    const noise = seededRandom(SEED + text.length) * 0.1 - 0.05;
+                    return {{
+                        width:                    m.width + noise,
+                        actualBoundingBoxLeft:    m.actualBoundingBoxLeft    || 0,
+                        actualBoundingBoxRight:   (m.actualBoundingBoxRight  || m.width) + noise,
+                        actualBoundingBoxAscent:  m.actualBoundingBoxAscent  || 0,
+                        actualBoundingBoxDescent: m.actualBoundingBoxDescent || 0,
+                        fontBoundingBoxAscent:    m.fontBoundingBoxAscent    || 0,
+                        fontBoundingBoxDescent:   m.fontBoundingBoxDescent   || 0,
+                        emHeightAscent:           m.emHeightAscent           || 0,
+                        emHeightDescent:          m.emHeightDescent          || 0,
+                        hangingBaseline:          m.hangingBaseline          || 0,
+                        alphabeticBaseline:       m.alphabeticBaseline       || 0,
+                        ideographicBaseline:      m.ideographicBaseline      || 0
+                    }};
+                }};
+
+                // offsetWidth/Height con micro-variación
+                [['offsetWidth',7],['offsetHeight',13],['clientWidth',17],['clientHeight',19]]
+                .forEach(function(pair) {{
+                    const desc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, pair[0]);
+                    if (!desc) return;
+                    Object.defineProperty(HTMLElement.prototype, pair[0], {{
+                        get: function() {{
+                            const v = desc.get.call(this);
+                            return typeof v === 'number' ? v + (v * (pair[1] % 10)) / 10000 : v;
+                        }},
+                        configurable: true
+                    }});
+                }});
+
+            }} catch (e) {{
+
+            }}
+        }})();
+        """
+
+    def generate_permissions_script(self) -> str:
+        """Falsifica Permissions API y enumerateDevices."""
+        return """
+        (function() {
+            'use strict';
+            try {
+                if (navigator.permissions && navigator.permissions.query) {
+                    const _origQuery = navigator.permissions.query.bind(navigator.permissions);
+                    navigator.permissions.query = function(parameters) {
+                        const prompted = [
+                            'geolocation','notifications','push','midi',
+                            'camera','microphone','clipboard-read','clipboard-write',
+                            'payment-handler','persistent-storage','accelerometer',
+                            'gyroscope','magnetometer','screen-wake-lock','xr-spatial-tracking'
+                        ];
+                        const state = prompted.includes(parameters.name) ? 'prompt' : 'prompt';
+                        return Promise.resolve({
+                            state: state, status: state, onchange: null,
+                            addEventListener: function() {},
+                            removeEventListener: function() {},
+                            dispatchEvent: function() { return true; }
+                        });
+                    };
+                }
+
+                if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+                    navigator.mediaDevices.enumerateDevices = function() {
+                        return Promise.resolve([
+                            { deviceId: 'default', kind: 'audioinput',  label: '', groupId: 'default' },
+                            { deviceId: 'default', kind: 'audiooutput', label: '', groupId: 'default' },
+                            { deviceId: 'default', kind: 'videoinput',  label: '', groupId: 'default' }
+                        ]);
+                    };
+                }
+
+            } catch (e) {
+
+            }
+        })();
+        """
+
+    def generate_performance_script(self) -> str:
+        """
+        FIX #5: performance.memory usa valores fijos deterministas, no Math.random().
+        Jitter en performance.now redondeado a 0.1ms para imitar throttling real.
+        """
+        return """
+        (function() {
+            'use strict';
+            try {
+                const _origNow = performance.now.bind(performance);
+                performance.now = function() {
+                    const raw = _origNow();
+                    // FIX #5: redondear a 0.1ms + ruido mínimo (imita throttling Chrome/Firefox)
+                    return Math.round(raw * 10) / 10 + (Math.random() * 0.1 - 0.05);
+                };
+
+                // Date.now: interceptar para consistencia con performance.now
+                const _origDateNow = Date.now.bind(Date);
+                Date.now = function() { return _origDateNow(); };
+
+                // FIX #5: memory con valores fijos (no random, para consistencia)
+                if (typeof performance !== 'undefined') {
+                    Object.defineProperty(performance, 'memory', {
+                        get: function() {
+                            return {
+                                jsHeapSizeLimit:  2172649472,
+                                totalJSHeapSize:  50000000,
+                                usedJSHeapSize:   30000000
+                            };
+                        },
+                        configurable: true
+                    });
+                }
+
+                // RAF timing
+                if (window.requestAnimationFrame) {
+                    const _origRAF = window.requestAnimationFrame;
+                    window.requestAnimationFrame = function(callback) {
+                        return _origRAF(function(ts) {
+                            callback(Math.round(ts * 10) / 10 + (Math.random() * 0.1 - 0.05));
+                        });
+                    };
+                }
+
+            } catch (e) {
+
+            }
+        })();
+        """
+
+    def generate_timezone_script(self) -> str:
+        """
+        FIX #6: getTimezoneOffset usa timestamps UTC precalculados para evitar
+        recursión. La versión original usaba getMonth() que puede llamar
+        internamente al getter que estamos sobreescribiendo.
+        """
+        tz = self.config.timezone
+        return f"""
+        (function() {{
+            'use strict';
+            try {{
+                const targetTimezone = '{tz}';
+
+                if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {{
+                    const _OrigDTF = Intl.DateTimeFormat;
+                    Intl.DateTimeFormat = function(locales, options) {{
+                        return new _OrigDTF(locales, Object.assign({{}}, options || {{}}, {{
+                            timeZone: targetTimezone
+                        }}));
+                    }};
+                    Intl.DateTimeFormat.prototype = _OrigDTF.prototype;
+                    Intl.DateTimeFormat.supportedLocalesOf = _OrigDTF.supportedLocalesOf;
+                }}
+
+                // FIX #6: precalcular timestamps DST fuera del getter
+                (function() {{
+                    const year = new Date().getUTCFullYear();
+                    const dstStart = Date.UTC(year, 2, 8,  2, 0, 0);
+                    const dstEnd   = Date.UTC(year, 10, 1, 2, 0, 0);
+
+                    const offsets = {{
+                        'America/New_York':    [240, 300],
+                        'America/Los_Angeles': [420, 480],
+                        'Europe/London':       [-60,   0],
+                        'Europe/Paris':        [-120, -60],
+                        'Asia/Tokyo':          [-540, -540],
+                        'Asia/Shanghai':       [-480, -480]
+                    }};
+                    const pair = offsets[targetTimezone] || [0, 0];
+
+                    Date.prototype.getTimezoneOffset = function() {{
+                        // getTime() no llama getTimezoneOffset → sin recursión
+                        const ts = this.getTime();
+                        return (ts >= dstStart && ts < dstEnd) ? pair[0] : pair[1];
+                    }};
+                }})();
+
+            }} catch (e) {{
+
+            }}
+        }})();
+        """
+
+    def generate_iframe_script(self) -> str:
+        """
+        FIX #8: eliminado el override de matchMedia que rompía media queries
+        legítimas de la página. Solo mantiene outerWidth/Height.
+        """
+        return f"""
+        (function() {{
+            'use strict';
+            try {{
+                // Solo corregir dimensiones de ventana
+                // FIX #8: matchMedia eliminado — rompía CSS responsive de la página
                 Object.defineProperty(window, 'outerWidth', {{
                     get: function() {{ return {self.config.screen_width}; }},
                     configurable: true
@@ -663,414 +928,114 @@ class FingerprintGenerator:
                     get: function() {{ return {self.config.screen_height} - 40; }},
                     configurable: true
                 }});
-                
-                console.log('[Anti-Detection] Screen spoofing aplicado');
             }} catch (e) {{
-                console.error('[Anti-Detection] Error en Screen spoofing:', e);
+
             }}
         }})();
         """
-    
-    def generate_webrtc_script(self) -> str:
+
+    def generate_antibot_extras_script(self) -> str:
         """
-        Genera script para prevenir WebRTC leaks.
-        
-        Returns:
-            str: Script JavaScript para inyección.
-        """
-        return """
-        // WebRTC Leak Prevention
-        (function() {
-            'use strict';
-            try {
-                // Override RTCPeerConnection
-                if (window.RTCPeerConnection) {
-                    const OriginalRTCPeerConnection = window.RTCPeerConnection;
-                    
-                    window.RTCPeerConnection = function(configuration, constraints) {
-                        // Filtrar servidores STUN/TURN que podrían revelar IP
-                        if (configuration && configuration.iceServers) {
-                            configuration.iceServers = configuration.iceServers.filter(server => {
-                                // Solo permitir servidores específicos
-                                return false; // Bloquear todos por defecto
-                            });
-                        }
-                        
-                        const pc = new OriginalRTCPeerConnection(configuration, constraints);
-                        
-                        // Override createDataChannel
-                        const originalCreateDataChannel = pc.createDataChannel.bind(pc);
-                        pc.createDataChannel = function(label, options) {
-                            // Limitar creación de canales de datos
-                            return originalCreateDataChannel(label, options);
-                        };
-                        
-                        return pc;
-                    };
-                    
-                    window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
-                }
-                
-                // Override webkitRTCPeerConnection (legacy)
-                if (window.webkitRTCPeerConnection) {
-                    window.webkitRTCPeerConnection = window.RTCPeerConnection;
-                }
-                
-                // Bloquear RTCDataChannel - Suavizado para no lanzar errores
-                if (window.RTCDataChannel) {
-                    const OriginalRTCDataChannel = window.RTCDataChannel;
-                    window.RTCDataChannel = function() {
-                        console.log('[Anti-Detection] RTCDataChannel blocked (silent)');
-                        return {};
-                    };
-                }
-                
-                // Bloquear acceso a IP local via WebRTC
-                const originalCreateOffer = RTCPeerConnection.prototype.createOffer;
-                RTCPeerConnection.prototype.createOffer = function(options) {
-                    const promise = originalCreateOffer.call(this, options);
-                    return promise.then(offer => {
-                        // Modificar SDP para evitar revelar IPs locales
-                        if (offer && offer.sdp) {
-                            offer.sdp = offer.sdp.replace(/\\r\\na=candidate:.*/g, '');
-                        }
-                        return offer;
-                    });
-                };
-                
-                console.log('[Anti-Detection] WebRTC leak prevention aplicado');
-            } catch (e) {
-                console.error('[Anti-Detection] Error en WebRTC prevention:', e);
-            }
-        })();
-        """
-    
-    def generate_font_script(self) -> str:
-        """
-        Genera script para añadir variación en font fingerprinting.
-        
-        Returns:
-            str: Script JavaScript para inyección.
+        Técnicas adicionales anti-bot de alto impacto:
+        - Notification API state (ausencia = sospechosa)
+        - serviceWorker present (ausencia = sospechosa)
+        - CSS getComputedStyle micro-variación
+        - setTimeout/setInterval precision fingerprint
+        - iframe sandbox detection
+        - Error stack trace sanitization
         """
         seed = self.config.seed
         return f"""
-        // Font Fingerprint Spoofing
         (function() {{
             'use strict';
+
+            // Notification API: estado 'default' (no granted ni denied = bot típico)
             try {{
-                const SEED = {seed};
-                
-                function seededRandom(seed) {{
-                    const x = Math.sin(seed) * 10000;
-                    return x - Math.floor(x);
-                }}
-                
-                // Override measureText para añadir variación sutil
-                const originalMeasureText = CanvasRenderingContext2D.prototype.measureText;
-                CanvasRenderingContext2D.prototype.measureText = function(text) {{
-                    const metrics = originalMeasureText.call(this, text);
-                    
-                    // Añadir variación sutil en las medidas
-                    const noise = seededRandom(SEED + text.length) * 0.1 - 0.05;
-                    
-                    // Crear un nuevo objeto con valores modificados
-                    return {{
-                        width: metrics.width + noise,
-                        actualBoundingBoxLeft: metrics.actualBoundingBoxLeft || 0,
-                        actualBoundingBoxRight: (metrics.actualBoundingBoxRight || metrics.width) + noise,
-                        actualBoundingBoxAscent: metrics.actualBoundingBoxAscent || 0,
-                        actualBoundingBoxDescent: metrics.actualBoundingBoxDescent || 0,
-                        fontBoundingBoxAscent: metrics.fontBoundingBoxAscent || 0,
-                        fontBoundingBoxDescent: metrics.fontBoundingBoxDescent || 0,
-                        emHeightAscent: metrics.emHeightAscent || 0,
-                        emHeightDescent: metrics.emHeightDescent || 0,
-                        hangingBaseline: metrics.hangingBaseline || 0,
-                        alphabeticBaseline: metrics.alphabeticBaseline || 0,
-                        ideographicBaseline: metrics.ideographicBaseline || 0
-                    }};
-                }};
-                
-                console.log('[Anti-Detection] Font fingerprint spoofing aplicado');
-            }} catch (e) {{
-                console.error('[Anti-Detection] Error en Font spoofing:', e);
-            }}
-        }})();
-        """
-    
-    def generate_permissions_script(self) -> str:
-        """
-        Genera script para falsificar la Permissions API.
-        
-        Returns:
-            str: Script JavaScript para inyección.
-        """
-        return """
-        // Permissions API Spoofing
-        (function() {
-            'use strict';
-            try {
-                // Override permissions.query
-                if (navigator.permissions && navigator.permissions.query) {
-                    const originalQuery = navigator.permissions.query.bind(navigator.permissions);
-                    
-                    navigator.permissions.query = function(parameters) {
-                        const permissionName = parameters.name;
-                        
-                        // Respuestas predefinidas para permisos comunes
-                        const defaultPermissions = {
-                            'geolocation': 'prompt',
-                            'notifications': 'prompt',
-                            'push': 'prompt',
-                            'midi': 'prompt',
-                            'camera': 'prompt',
-                            'microphone': 'prompt',
-                            'clipboard-read': 'prompt',
-                            'clipboard-write': 'prompt',
-                            'payment-handler': 'prompt',
-                            'persistent-storage': 'prompt',
-                            'accelerometer': 'prompt',
-                            'gyroscope': 'prompt',
-                            'magnetometer': 'prompt',
-                            'screen-wake-lock': 'prompt',
-                            'xr-spatial-tracking': 'prompt'
-                        };
-                        
-                        const state = defaultPermissions[permissionName] || 'prompt';
-                        
-                        return Promise.resolve({
-                            state: state,
-                            status: state,
-                            onchange: null,
-                            addEventListener: function() {},
-                            removeEventListener: function() {},
-                            dispatchEvent: function() { return true; }
-                        });
-                    };
-                }
-                
-                // Override mediaDevices.enumerateDevices
-                if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-                    const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-                    
-                    navigator.mediaDevices.enumerateDevices = function() {
-                        // Devolver dispositivos genéricos
-                        return Promise.resolve([
-                            { deviceId: 'default', kind: 'audioinput', label: '', groupId: 'default' },
-                            { deviceId: 'default', kind: 'audiooutput', label: '', groupId: 'default' },
-                            { deviceId: 'default', kind: 'videoinput', label: '', groupId: 'default' }
-                        ]);
-                    };
-                }
-                
-                console.log('[Anti-Detection] Permissions spoofing aplicado');
-            } catch (e) {
-                console.error('[Anti-Detection] Error en Permissions spoofing:', e);
-            }
-        })();
-        """
-    
-    def generate_performance_script(self) -> str:
-        """
-        Genera script para añadir jitter a las funciones de timing.
-        
-        Returns:
-            str: Script JavaScript para inyección.
-        """
-        return """
-        // Performance Timing Jitter
-        (function() {
-            'use strict';
-            try {
-                // Jitter base (±0.1ms)
-                const JITTER_RANGE = 0.1;
-                
-                // Override performance.now()
-                const originalNow = performance.now.bind(performance);
-                let lastNow = originalNow();
-                let offset = 0;
-                
-                performance.now = function() {
-                    const realNow = originalNow();
-                    
-                    // Solo añadir jitter si el tiempo avanzó
-                    if (realNow > lastNow) {
-                        offset += (Math.random() - 0.5) * JITTER_RANGE * 2;
-                        lastNow = realNow;
-                    }
-                    
-                    return realNow + offset;
-                };
-                
-                // Override Date.now()
-                const originalDateNow = Date.now;
-                Date.now = function() {
-                    return Math.floor(originalDateNow() + (Math.random() - 0.5) * JITTER_RANGE * 2);
-                };
-                
-                // Performance memory spoofing
-                if (performance.memory) {
-                    Object.defineProperty(performance, 'memory', {
-                        get: function() {
-                            return {
-                                totalJSHeapSize: 50000000 + Math.floor(Math.random() * 50000000),
-                                usedJSHeapSize: 30000000 + Math.floor(Math.random() * 30000000),
-                                jsHeapSizeLimit: 2000000000
-                            };
-                        },
-                        configurable: true
-                    });
-                }
-                
-                // Override requestAnimationFrame timing
-                const originalRAF = window.requestAnimationFrame;
-                window.requestAnimationFrame = function(callback) {
-                    return originalRAF(function(timestamp) {
-                        // Añadir jitter sutil al timestamp
-                        callback(timestamp + (Math.random() - 0.5) * JITTER_RANGE);
-                    });
-                };
-                
-                console.log('[Anti-Detection] Performance timing jitter aplicado');
-            } catch (e) {
-                console.error('[Anti-Detection] Error en Performance jitter:', e);
-            }
-        })();
-        """
-    
-    def generate_timezone_script(self) -> str:
-        """
-        Genera script para falsificar timezone.
-        
-        Returns:
-            str: Script JavaScript para inyección.
-        """
-        return f"""
-        // Timezone Spoofing
-        (function() {{
-            'use strict';
-            try {{
-                const targetTimezone = '{self.config.timezone}';
-                
-                // Override Intl.DateTimeFormat
-                const OriginalDateTimeFormat = Intl.DateTimeFormat;
-                Intl.DateTimeFormat = function(locales, options) {{
-                    return new OriginalDateTimeFormat(locales, {{
-                        ...options,
-                        timeZone: targetTimezone
+                if (typeof Notification !== 'undefined') {{
+                    Object.defineProperty(Notification, 'permission', {{
+                        get: function() {{ return 'default'; }}, configurable: true
                     }});
+                }}
+            }} catch(e) {{}}
+
+            // serviceWorker: presencia esperada en Chrome real
+            try {{
+                if (!navigator.serviceWorker) {{
+                    Object.defineProperty(navigator, 'serviceWorker', {{
+                        get: function() {{
+                            return {{
+                                ready: Promise.resolve({{}}),
+                                register: function() {{ return Promise.resolve({{}}); }},
+                                getRegistration: function() {{ return Promise.resolve(undefined); }},
+                                getRegistrations: function() {{ return Promise.resolve([]); }},
+                                addEventListener: function() {{}},
+                                removeEventListener: function() {{}}
+                            }};
+                        }},
+                        configurable: true
+                    }});
+                }}
+            }} catch(e) {{}}
+
+            // setTimeout/setInterval: normalizar precision para evitar timing fingerprint
+            try {{
+                const _origST = window.setTimeout;
+                const _origSI = window.setInterval;
+                window.setTimeout = function(fn, delay) {{
+                    return _origST(fn, Math.max(delay || 0, 1));
                 }};
-                Intl.DateTimeFormat.prototype = OriginalDateTimeFormat.prototype;
-                Intl.DateTimeFormat.supportedLocalesOf = OriginalDateTimeFormat.supportedLocalesOf;
-                
-                // Override Date.getTimezoneOffset
-                const targetOffsets = {{
-                    'America/New_York': 300,
-                    'America/Los_Angeles': 480,
-                    'Europe/London': 0,
-                    'Europe/Paris': -60,
-                    'Asia/Tokyo': -540,
-                    'Asia/Shanghai': -480
+                window.setInterval = function(fn, delay) {{
+                    return _origSI(fn, Math.max(delay || 0, 1));
                 }};
-                
-                const offset = targetOffsets[targetTimezone] || 0;
-                
-                Object.defineProperty(Date.prototype, 'getTimezoneOffset', {{
-                    value: function() {{
-                        // Ajustar según horario de verano
-                        const month = this.getMonth();
-                        if (targetTimezone === 'America/New_York') {{
-                            // DST: marzo-noviembre
-                            if (month >= 2 && month <= 10) return 240;
-                            return 300;
+            }} catch(e) {{}}
+
+            // Error stack traces: sanitizar paths de Selenium/ChromeDriver
+            try {{
+                const _origPrepare = Error.prepareStackTrace;
+                Error.prepareStackTrace = function(err, stack) {{
+                    if (_origPrepare) {{
+                        const result = _origPrepare(err, stack);
+                        if (typeof result === 'string') {{
+                            return result
+                                .replace(/chromedriver/gi, 'chrome')
+                                .replace(/selenium/gi, 'browser')
+                                .replace(/webdriver/gi, 'driver');
                         }}
-                        return offset;
-                    }},
-                    configurable: true,
-                    writable: true
-                }});
-                
-                console.log('[Anti-Detection] Timezone spoofing aplicado');
-            }} catch (e) {{
-                console.error('[Anti-Detection] Error en Timezone spoofing:', e);
-            }}
+                        return result;
+                    }}
+                    return stack.toString();
+                }};
+            }} catch(e) {{}}
+
+            // CSS getComputedStyle: micro-variación para evitar font/layout fingerprint
+            try {{
+                const _seed = {seed};
+                function _sr(s) {{ const x = Math.sin(s) * 10000; return x - Math.floor(x); }}
+                const _origGCS = window.getComputedStyle;
+                window.getComputedStyle = function(el, pseudo) {{
+                    const style = _origGCS.call(window, el, pseudo);
+                    const _origGPV = style.getPropertyValue.bind(style);
+                    style.getPropertyValue = function(prop) {{
+                        const val = _origGPV(prop);
+                        // Solo añadir micro-variación a propiedades de dimensión
+                        if (prop === 'letter-spacing' || prop === 'word-spacing') {{
+                            const noise = _sr(_seed + prop.length) * 0.02 - 0.01;
+                            const num = parseFloat(val);
+                            if (!isNaN(num)) return (num + noise) + 'px';
+                        }}
+                        return val;
+                    }};
+                    return style;
+                }};
+            }} catch(e) {{}}
+
         }})();
         """
-    
-    def generate_iframe_script(self) -> str:
-        """
-        Genera script para prevenir detección via iframes.
-        
-        Returns:
-            str: Script JavaScript para inyección.
-        """
-        return """
-        // iframe Detection Prevention
-        (function() {
-            'use strict';
-            try {
-                // Ocultar que la página está siendo automatizada
-                Object.defineProperty(window, 'outerWidth', {
-                    get: function() { return window.innerWidth; },
-                    configurable: true
-                });
-                
-                Object.defineProperty(window, 'outerHeight', {
-                    get: function() { return window.innerHeight + 100; },  // +100 for browser chrome
-                    configurable: true
-                });
-                
-                // Prevenir detección de window size
-                const originalMatchMedia = window.matchMedia;
-                window.matchMedia = function(query) {
-                    const result = originalMatchMedia(query);
-                    
-                    // Falsificar media queries
-                    if (query.includes('width') || query.includes('height')) {
-                        return {
-                            matches: false,
-                            media: query,
-                            onchange: null,
-                            addListener: function() {},
-                            removeListener: function() {},
-                            addEventListener: function() {},
-                            removeEventListener: function() {},
-                            dispatchEvent: function() { return false; }
-                        };
-                    }
-                    
-                    return result;
-                };
-                
-                console.log('[Anti-Detection] iframe detection prevention aplicado');
-            } catch (e) {
-                console.error('[Anti-Detection] Error en iframe prevention:', e);
-            }
-        })();
-        """
-    
+
     def generate_all_scripts(self) -> str:
         """
-        Genera todos los scripts de fingerprinting combinados.
-        
-        Returns:
-            str: Script JavaScript combinado para inyección.
+        Genera todos los scripts combinados según el nivel configurado.
         """
-        scripts = [
-            self.generate_webdriver_script(),
-            self.generate_canvas_script(),
-            self.generate_webgl_script(),
-            self.generate_audio_script(),
-            self.generate_navigator_script(),
-            self.generate_screen_script(),
-            self.generate_webrtc_script(),
-            self.generate_font_script(),
-            self.generate_permissions_script(),
-            self.generate_performance_script(),
-            self.generate_timezone_script(),
-            self.generate_iframe_script(),
-        ]
-        
-        # Filtrar según nivel
         if self.level == "basic":
             scripts = [
                 self.generate_webdriver_script(),
@@ -1083,36 +1048,45 @@ class FingerprintGenerator:
                 self.generate_webgl_script(),
                 self.generate_navigator_script(),
                 self.generate_screen_script(),
+                self.generate_timezone_script(),
             ]
-        
+        else:  # full
+            scripts = [
+                self.generate_webdriver_script(),
+                self.generate_canvas_script(),
+                self.generate_webgl_script(),
+                self.generate_audio_script(),
+                self.generate_navigator_script(),
+                self.generate_screen_script(),
+                self.generate_webrtc_script(),
+                self.generate_font_script(),
+                self.generate_permissions_script(),
+                self.generate_performance_script(),
+                self.generate_timezone_script(),
+                self.generate_iframe_script(),
+                self.generate_antibot_extras_script(),
+            ]
+
         return "\n".join(scripts)
-    
+
     def get_script_hash(self) -> str:
-        """
-        Devuelve un hash del script para verificación.
-        
-        Returns:
-            str: Hash MD5 del script.
-        """
-        script = self.generate_all_scripts()
-        return hashlib.md5(script.encode()).hexdigest()
+        """Hash MD5 del script generado."""
+        return hashlib.md5(self.generate_all_scripts().encode()).hexdigest()
 
 
-def create_fingerprint_from_profile(profile: Dict[str, Any], level: str = "full") -> FingerprintGenerator:
+def create_fingerprint_from_profile(profile: Dict[str, Any],
+                                    level: str = "full") -> FingerprintGenerator:
     """
-    Crea un generador de fingerprint desde un perfil de hardware.
-    
+    Crea un FingerprintGenerator desde un dict de HARDWARE_PROFILES.
+
     Args:
-        profile: Diccionario con configuración del perfil.
-        level: Nivel de anti-detección.
-    
-    Returns:
-        FingerprintGenerator: Generador configurado.
+        profile: dict con keys del perfil de hardware.
+        level:   nivel de anti-detección (basic | standard | full).
     """
     config = FingerprintConfig(
         seed=profile.get("seed", random.randint(1, 1000000)),
         webgl_vendor=profile.get("webgl_vendor", "Google Inc. (NVIDIA)"),
-        webgl_renderer=profile.get("webgl_renderer", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0)"),
+        webgl_renderer=profile.get("webgl_renderer", "ANGLE (NVIDIA GeForce RTX 3080)"),
         hardware_concurrency=profile.get("hardware_concurrency", 8),
         device_memory=profile.get("device_memory", 8),
         platform=profile.get("platform", "Win32"),
@@ -1122,5 +1096,4 @@ def create_fingerprint_from_profile(profile: Dict[str, Any], level: str = "full"
         timezone=profile.get("timezone", "America/New_York"),
         languages=profile.get("languages", ["en-US", "en"]),
     )
-    
     return FingerprintGenerator(config, level)

@@ -16,6 +16,12 @@ Un cliente no oficial para DeepSeek (chat.deepseek.com) con capacidades avanzada
 - **Permissions API Spoofing**: Permisos falsificados
 - **Performance Timing Jitter**: Variación en timing de rendimiento
 
+### 🛠️ Interfaz de Usuario de Combate
+- **Lanzador Unificado (`conectar_directo.bat`)**: Menú principal con selección numérica para arrancar el chat o escáner.
+- **Modo Toggle Rápido**: Activa/Desactiva DeepThink y Búsqueda directamente desde el menú del BAT o dentro del chat.
+- **Menú Numérico en Tiempo Real**: Durante el chat, usa [1] para DeepThink, [2] para Search, [3] para Historial y [4] para Nuevo Chat.
+- **Blindaje de Botones**: Identificación precisa de botones (Enviar vs Adjuntar) mediante análisis dinámico de clases mutantes.
+
 ### Perfiles de Hardware
 Perfiles predefinidos para simular diferentes dispositivos:
 - `gaming_pc` - PC de gaming de alta gama con RTX 4090
@@ -95,20 +101,22 @@ LOG_LEVEL=INFO
 
 ## 📖 Uso
 
-### Chat Interactivo
+### Lanzador Principal (Recomendado)
+
+Simplemente ejecuta el archivo `.bat` en la raíz del proyecto:
+```bash
+conectar_directo.bat
+```
+Esto abrirá un menú interactivo donde podrás configurar los modos (Think/Search) y lanzar el chat.
+
+### Chat Interactivo vía Terminal
 
 ```bash
-# Uso básico
-python app/interactive_chat.py
+# Con modos pre-activados desde CLI
+python app/interactive_chat.py --think --search
 
 # Con perfil específico
 python app/interactive_chat.py --profile gaming_pc
-
-# Modo headless
-python app/interactive_chat.py --headless
-
-# Ver todas las opciones
-python app/interactive_chat.py --help
 ```
 
 ### Como librería
@@ -218,16 +226,15 @@ deepseek-client/
 
 ## 🎯 Comandos del Chat Interactivo
 
-| Comando | Descripción |
+| Comando / Tecla | Descripción |
 |---------|-------------|
-| `/nuevo` | Iniciar nueva conversación |
-| `/historial` | Ver historial de conversaciones |
-| `/cargar <id>` | Cargar una conversación guardada |
-| `/guardar [título]` | Guardar la conversación actual |
-| `/limpiar` | Limpiar la pantalla |
+| `[1]` o `/think` | Activar/Desactivar modo DeepThink (R1) |
+| `[2]` o `/search` | Activar/Desactivar búsqueda en la web |
+| `[3]` o `/historial`| Ver y seleccionar conversaciones anteriores |
+| `[4]` o `/nuevo` | Iniciar nueva conversación limpando la UI |
+| `/limpiar` | Limpiar la pantalla de la terminal |
 | `/perfil` | Mostrar perfil de hardware actual |
 | `/stats` | Ver estadísticas de uso |
-| `/ayuda` | Mostrar ayuda |
 | `/salir` | Salir del programa |
 
 ## ⚙️ Niveles de Anti-detección
@@ -298,13 +305,14 @@ Las contribuciones son bienvenidas. Por favor:
 
 ## 📝 Changelog
 
+### v1.1.0 (Marzo 2026)
+- **Corrección Crítica de Selectores**: Separación absoluta entre botones de `Enviar` y `Adjuntar` mediante análisis de estado mutante.
+- **Menú Maestro BAT**: Implementación de lanzador numérico de estados en `conectar_directo.bat`.
+- **Modos Interactivos**: Soporte para cambio de modos vía teclado (1, 2, 3, 4) dentro del bucle de chat.
+- **Cierre de Modales**: Implementación de lógica de escape (`Keys.ESCAPE`) para desbloquear la interfaz cuando se abren popups de adjuntos.
+
 ### v1.0.0
-- Versión inicial
-- Anti-detección avanzada
-- Perfiles de hardware
-- Comportamiento humano simulado
-- Servidor API OpenAI compatible
-- Interfaz interactiva
+- Versión inicial con Anti-detección avanzada.
 
 ---
 

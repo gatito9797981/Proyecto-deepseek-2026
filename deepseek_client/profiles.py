@@ -169,19 +169,20 @@ class HardwareProfile:
             "fonts": self.fonts,
             "plugins": self.plugins,
             "seed_base": self.seed_base,
+            "seed": self.seed_base,  # FIX #8: create_fingerprint_from_profile lee 'seed', no 'seed_base'
         }
     
     def get_seed(self, instance_id: int = 0) -> int:
         """
         Genera una semilla determinista para una instancia.
-        
+
         Args:
             instance_id: ID de la instancia (para múltiples navegadores).
-        
+
         Returns:
             int: Semilla para el generador de fingerprint.
         """
-        return self.seed_base + instance_id * 10000 + random.randint(0, 9999)
+        return self.seed_base + instance_id * 10000  # FIX: eliminado random.randint → la semilla ahora es determinista
 
 
 # ============================================================================

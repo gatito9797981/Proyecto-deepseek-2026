@@ -34,10 +34,9 @@ import sys
 import json
 import time
 import uuid
-import asyncio
 import argparse
 import logging
-from typing import Optional, List, Dict, Any, Generator
+from typing import Optional, List, Dict, Any          # FIX: quitados asyncio y Generator (no usados)
 from dataclasses import dataclass, asdict
 
 # Añadir directorio padre al path
@@ -55,6 +54,7 @@ except ImportError:
 from deepseek_client.config import Config, config
 from deepseek_client.client import DeepSeekClient, DeepSeekModel, DeepSeekResponse
 from deepseek_client.driver_pool import DriverPool, get_pool
+from deepseek_client.history import HistoryManager   # FIX #2: necesario para inicializar client
 
 
 # Configuración
@@ -180,101 +180,89 @@ def get_model(model_id: str):
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
-    """
-    Endpoint principal para completions de chat.
-    
-    Soporta tanto respuestas completas como streaming.
-    """
+    # FIX #1: guard — pool puede ser None si el servidor arrancó sin initialize_pool()
+    if driver_pool is None:
+        return jsonify({"error": "Driver pool no inicializado"}), 503
+
     try:
         data = request.get_json()
-        
-        # Validar request
+
         if not data:
             return jsonify({"error": "Request body requerido"}), 400
-        
+
         messages = data.get('messages', [])
         if not messages:
             return jsonify({"error": "Messages requerido"}), 400
-        
+
         model = data.get('model', 'deepseek-chat')
         stream = data.get('stream', False)
-        
-        # Obtener el último mensaje del usuario
+
+        # FIX #3: conversation_history era construido pero nunca usado por el cliente.
+        # El contexto de conversación lo mantiene el browser en la sesión de Selenium.
+        # Solo necesitamos el último mensaje de usuario.
         user_message = None
-        conversation_history = []
-        
         for msg in messages:
-            role = msg.get('role', '')
-            content = msg.get('content', '')
-            
-            if role == 'user':
-                user_message = content
-            
-            conversation_history.append({
-                "role": role,
-                "content": content
-            })
-        
+            if msg.get('role') == 'user':
+                user_message = msg.get('content', '')
+
         if not user_message:
             return jsonify({"error": "No se encontró mensaje de usuario"}), 400
-        
+
         logger.info(f"Recibida solicitud: model={model}, stream={stream}, msg_len={len(user_message)}")
-        
-        # Procesar con el cliente
+
         if stream:
-            return stream_response(user_message, model, conversation_history)
+            return stream_response(user_message, model)
         else:
-            return complete_response(user_message, model, conversation_history)
-    
+            return complete_response(user_message, model)
+
     except Exception as e:
         logger.error(f"Error en chat_completions: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-def complete_response(
-    message: str,
-    model: str,
-    history: List[Dict[str, str]]
-) -> tuple:
+def _build_client(driver) -> DeepSeekClient:
     """
-    Genera una respuesta completa (no streaming).
-    
-    Args:
-        message: Mensaje del usuario
-        model: Modelo a usar
-        history: Historial de conversación
-    
-    Returns:
-        tuple: (response_json, status_code)
+    FIX #2: construye un DeepSeekClient válido reutilizando un driver del pool.
+    __new__ bypasea __init__, por lo que hay que inicializar todos los atributos
+    que _ask_impl() necesita para no lanzar AttributeError.
     """
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.driver = driver
+    client.config = config
+    client.logger = logger
+    client.history = HistoryManager(config.history_dir)
+    client._is_logged_in = True          # el driver del pool ya tiene sesión activa
+    client._current_model = DeepSeekModel.DEEPSEEK_CHAT
+    client._last_response = None
+    client._conversation_started = False
+    client.api_headers = {
+        "x-app-version": "20241129.1",
+        "x-client-version": "1.7.0",
+        "x-client-platform": "web"
+    }
+    client.saved_user_token = None
+    client.saved_waf_token = None
+    client.saved_smid_v2 = None
+    return client
+
+
+def complete_response(message: str, model: str):          # FIX #3: eliminado param history inutilizado
     try:
-        # Obtener driver del pool
         with driver_pool.get_driver() as driver:
-            # Crear cliente temporal con el driver
-            client = DeepSeekClient.__new__(DeepSeekClient)
-            client.driver = driver
-            client.config = config
-            client.logger = logger
-            
-            # Enviar mensaje y obtener respuesta
+            client = _build_client(driver)                # FIX #2: usa helper completo
             response = client.ask(message)
-            
+
             if response.is_error:
                 return jsonify({"error": response.metadata.get("error", "Error desconocido")}), 500
-            
-            # Construir respuesta
+
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-            
             completion = ChatCompletionResponse(
                 id=completion_id,
                 model=model,
                 choices=[
                     ChatCompletionChoice(
                         index=0,
-                        message={
-                            "role": "assistant",
-                            "content": response.content
-                        },
+                        message={"role": "assistant", "content": response.content},
                         finish_reason="stop"
                     )
                 ],
@@ -284,105 +272,60 @@ def complete_response(
                     "total_tokens": (len(message) + len(response.content)) // 4
                 }
             )
-            
             return jsonify(asdict(completion))
-    
+
     except Exception as e:
         logger.error(f"Error en complete_response: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-def stream_response(
-    message: str,
-    model: str,
-    history: List[Dict[str, str]]
-) -> Response:
-    """
-    Genera una respuesta en streaming.
-    
-    Args:
-        message: Mensaje del usuario
-        model: Modelo a usar
-        history: Historial de conversación
-    
-    Returns:
-        Response: Flask streaming response
-    """
+def stream_response(message: str, model: str):            # FIX #3: eliminado param history inutilizado
     def generate():
         try:
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-            
-            # Enviar mensaje inicial
+
             initial_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"role": "assistant"},
-                    "finish_reason": None
-                }]
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
             }
             yield f"data: {json.dumps(initial_chunk)}\n\n"
-            
-            # Obtener driver del pool
-            with driver_pool.get_driver() as driver:
-                client = DeepSeekClient.__new__(DeepSeekClient)
-                client.driver = driver
-                client.config = config
-                client.logger = logger
-                
-                # Stream de la respuesta
+
+            with driver_pool.get_driver() as driver:     # FIX #1: driver_pool ya validado arriba
+                client = _build_client(driver)            # FIX #2: usa helper completo
+
                 full_content = ""
                 for chunk in client.ask_stream(message):
                     full_content += chunk
-                    
                     data_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": chunk},
-                            "finish_reason": None
-                        }]
+                        "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
                     }
                     yield f"data: {json.dumps(data_chunk)}\n\n"
-                
-                # Chunk final
+
                 final_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }]
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 }
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
-        
+
         except Exception as e:
             logger.error(f"Error en stream_response: {e}")
-            error_chunk = {
-                "error": {
-                    "message": str(e),
-                    "type": "internal_error"
-                }
-            }
-            yield f"data: {json.dumps(error_chunk)}\n\n"
-    
+            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'internal_error'}})}\n\n"
+
     return Response(
         stream_with_context(generate()),
         mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
     )
 
 

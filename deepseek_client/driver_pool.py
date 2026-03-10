@@ -337,59 +337,54 @@ class DriverPool:
     def _perform_health_check(self):
         """Realiza health check de todos los drivers."""
         self.logger.debug("Realizando health check...")
-        
+
+        # FIX #7: solo recolectar bajo el lock, sin ops lentas adentro
         with self._lock:
             drivers_to_replace = []
-            
+
             for wrapper in self._drivers:
-                # Verificar edad
-                if wrapper.get_age() > self.max_age:
+                # FIX #6: age check ahora respeta is_busy
+                if wrapper.get_age() > self.max_age and not wrapper.is_busy:
                     self.logger.info(f"Driver {wrapper.driver_id} excedió edad máxima")
                     drivers_to_replace.append(wrapper)
                     continue
-                
-                # Verificar tiempo inactivo (solo si no está ocupado)
+
                 if not wrapper.is_busy and wrapper.get_idle_time() > self.max_idle:
                     self.logger.info(f"Driver {wrapper.driver_id} inactivo por demasiado tiempo")
                     drivers_to_replace.append(wrapper)
                     continue
-                
-                # Verificar salud
+
                 if not wrapper.is_healthy():
                     self.logger.warning(f"Driver {wrapper.driver_id} no saludable")
                     drivers_to_replace.append(wrapper)
-            
-            # Reemplazar drivers necesarios
-            for wrapper in drivers_to_replace:
-                self._replace_driver(wrapper)
+
+        # FIX #7: close() y create_driver() (lanzar Chrome) fuera del lock
+        for wrapper in drivers_to_replace:
+            self._replace_driver(wrapper)
     
     def _replace_driver(self, old_wrapper: DriverWrapper):
         """
         Reemplaza un driver por uno nuevo.
-        
+
         Args:
             old_wrapper: Wrapper del driver a reemplazar
         """
         self.logger.info(f"Reemplazando driver {old_wrapper.driver_id}")
-        
+
         try:
-            # Cerrar driver antiguo
             old_wrapper.driver.close()
         except Exception as e:
             self.logger.warning(f"Error cerrando driver antiguo: {e}")
-        
-        # Crear nuevo driver
+
+        # create_driver puede tardar segundos (lanza Chrome) — ya está fuera del lock
         new_wrapper = self._create_driver()
-        
+
         with self._lock:
-            # Actualizar lista de drivers
             self._drivers = [
-                w for w in self._drivers 
+                w for w in self._drivers
                 if w.driver_id != old_wrapper.driver_id
             ]
             self._drivers.append(new_wrapper)
-            
-            # Añadir a disponibles
             self._available.put(new_wrapper.driver_id)
     
     def get_status(self) -> dict:
@@ -427,38 +422,51 @@ class DriverPool:
     def resize(self, new_size: int):
         """
         Cambia el tamaño del pool.
-        
+
         Args:
             new_size: Nuevo tamaño del pool
         """
         with self._lock:
             self.logger.info(f"Cambiando tamaño del pool: {self.size} -> {new_size}")
-            
+
             if new_size > self.size:
-                # Añadir drivers
                 for _ in range(new_size - self.size):
                     wrapper = self._create_driver()
                     self._drivers.append(wrapper)
                     self._available.put(wrapper.driver_id)
-            
+
             elif new_size < self.size:
-                # Eliminar drivers (solo los disponibles)
                 to_remove = self.size - new_size
                 removed = 0
-                
+                removed_ids = set()
+
                 for wrapper in list(self._drivers):
                     if removed >= to_remove:
                         break
-                    
+
                     if not wrapper.is_busy:
                         try:
                             wrapper.driver.close()
                         except Exception:
                             pass
-                        
+
+                        # FIX #5: rastrear IDs eliminados para limpiar la cola
+                        removed_ids.add(wrapper.driver_id)
                         self._drivers.remove(wrapper)
                         removed += 1
-            
+
+                # FIX #5: reconstruir _available sin los IDs cerrados
+                if removed_ids:
+                    new_available = Queue()
+                    while not self._available.empty():
+                        try:
+                            did = self._available.get_nowait()
+                            if did not in removed_ids:
+                                new_available.put(did)
+                        except Empty:
+                            break
+                    self._available = new_available
+
             self.size = new_size
     
     def close(self):

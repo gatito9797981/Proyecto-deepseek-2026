@@ -346,9 +346,9 @@ class HumanTyping:
     
     def __init__(
         self,
-        mean_delay: float = 50.0,  # ms
-        std_delay: float = 20.0,
-        error_rate: float = 0.02,
+        mean_delay: float = 25.0,  # ms
+        std_delay: float = 10.0,
+        error_rate: float = 0.005,
         pause_on_punctuation: float = 0.15,  # probabilidad de pausa
         pause_duration: float = 200.0  # ms
     ):

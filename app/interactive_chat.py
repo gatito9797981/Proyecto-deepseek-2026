@@ -72,7 +72,9 @@ class InteractiveChat:
         self,
         profile_name: Optional[str] = None,
         headless: bool = False,
-        config_obj: Optional[Config] = None
+        config_obj: Optional[Config] = None,
+        initial_think: bool = False,
+        initial_search: bool = False
     ):
         """
         Inicializa la interfaz de chat.
@@ -81,6 +83,8 @@ class InteractiveChat:
             profile_name: Nombre del perfil de hardware
             headless: Si ejecutar en modo headless
             config_obj: Configuración personalizada
+            initial_think: Si activar DeepThink al iniciar
+            initial_search: Si activar Búsqueda al iniciar
         """
         self.config = config_obj or config
         self.console = Console(theme=custom_theme) if HAS_RICH else None
@@ -89,6 +93,10 @@ class InteractiveChat:
         self.headless = headless
         self.client: Optional[DeepSeekClient] = None
         self.is_running = False
+        
+        # Toggles de modos
+        self.think_enabled = initial_think
+        self.search_enabled = initial_search
         
         # Estadísticas
         self.message_count = 0
@@ -128,9 +136,11 @@ class InteractiveChat:
 Bienvenido al cliente no oficial de DeepSeek con anti-detección avanzada.
 
 [yellow]Comandos disponibles:[/yellow]
+  • [cyan]/think[/cyan] - Activar/Desactivar DeepThink (R1)
+  • [cyan]/search[/cyan] - Activar/Desactivar Búsqueda Web
   • [green]/nuevo[/green] - Iniciar nueva conversación
-  • [green]/historial[/green] - Ver historial de conversaciones
-  • [green]/cargar <id>[/green] - Cargar conversación guardada
+  • [green]/historial[/green] - Seleccionar conversaciones anteriores
+  • [green]/cargar <id>[/green] - Cargar conversación guardada directamente
   • [green]/guardar [título][/green] - Guardar conversación actual
   • [green]/limpiar[/green] - Limpiar la pantalla
   • [green]/perfil[/green] - Ver perfil de hardware
@@ -147,9 +157,13 @@ Bienvenido al cliente no oficial de DeepSeek con anti-detección avanzada.
         help_text = """
 [bold]Comandos disponibles:[/bold]
 
+[cyan]Modos de Interacción:[/cyan]
+  /think, /t             Alternar modo DeepThink ON/OFF
+  /search, /s            Alternar modo Búsqueda ON/OFF
+
 [yellow]Gestión de conversaciones:[/yellow]
   /nuevo, /new           Iniciar una nueva conversación
-  /historial, /history   Listar conversaciones guardadas
+  /historial, /history   Seleccionar desde el historial interactivamente
   /cargar <id>           Cargar una conversación específica
   /guardar [título]      Guardar la conversación actual
 
@@ -245,6 +259,21 @@ Bienvenido al cliente no oficial de DeepSeek con anti-detección avanzada.
             print("\nHistorial de conversaciones:")
             for conv in conversations:
                 print(f"  [{conv['id']}] {conv['title']} ({conv['message_count']} msgs)")
+                
+        # Menú Interactivo de Carga
+        if self.console:
+            choice = Prompt.ask("\n[bold cyan]Elige el ID de la conversación a cargar (o pulsa Enter para cancelar)[/bold cyan]")
+        else:
+            choice = input("\nElige el ID de la conversación a cargar (o pulsa Enter para cancelar): ")
+            
+        choice = choice.strip()
+        if choice:
+            # Buscar coincidencia exacta o coincidencia de prefijo corto (ej: 8 caracteres)
+            matching_ids = [c['id'] for c in conversations if c['id'].startswith(choice)]
+            if matching_ids:
+                self.load_conversation(matching_ids[0])
+            else:
+                self._print(f"No se encontró ninguna conversación con el ID o prefijo: {choice}", style="error")
     
     def load_conversation(self, conv_id: str):
         """Carga una conversación por su ID."""
@@ -301,6 +330,21 @@ Bienvenido al cliente no oficial de DeepSeek con anti-detección avanzada.
         # Comandos de ayuda
         elif cmd in ['/ayuda', '/help', '/?']:
             self.show_help()
+            
+        # Alternar Modos
+        elif cmd in ['/think', '/deepthink', '/t']:
+            self.think_enabled = not self.think_enabled
+            estado = "ACTIVADO" if self.think_enabled else "DESACTIVADO"
+            self._print(f"Modo DeepThink {estado}", style="success" if self.think_enabled else "warning")
+            if self.client:
+                self.client.toggle_deepthink(self.think_enabled)
+                
+        elif cmd in ['/search', '/buscar', '/s']:
+            self.search_enabled = not self.search_enabled
+            estado = "ACTIVADO" if self.search_enabled else "DESACTIVADO"
+            self._print(f"Modo Búsqueda Web {estado}", style="success" if self.search_enabled else "warning")
+            if self.client:
+                self.client.toggle_search(self.search_enabled)
         
         # Nueva conversación
         elif cmd in ['/nuevo', '/new']:
@@ -369,19 +413,18 @@ Bienvenido al cliente no oficial de DeepSeek con anti-detección avanzada.
         self._print("\n[Usuario]: ", style="user")
         self._print_markdown(message)
         
+        # Asegurar estado exacto del modo antes de enviar
+        self.client.toggle_deepthink(self.think_enabled)
+        self.client.toggle_search(self.search_enabled)
+
         # Enviar y recibir respuesta
         self._print("\n[DeepSeek]: ", style="assistant")
         
         try:
             # Usar streaming si Rich está disponible
             if self.console:
-                response_text = ""
-                
-                with self.console.status("[bold green]Generando respuesta...[/bold green]"):
-                    for chunk in self.client.ask_stream(message):
-                        response_text += chunk
-                        self.console.print(chunk, end="", style="assistant")
-                
+                for chunk in self.client.ask_stream(message):
+                    self.console.print(chunk, end="", style="assistant")
                 self.console.print()  # Nueva línea
                 
             else:
@@ -403,7 +446,7 @@ Bienvenido al cliente no oficial de DeepSeek con anti-detección avanzada.
             bool: True si se inicializó correctamente
         """
         self._print("Inicializando cliente DeepSeek...", style="info")
-        self._print(f"Perfil: {self.profile_name or 'aleatorio'}", style="info")
+        self._print(f"Perfil de hardware: {self.profile_name or self.config.fingerprint_profile}", style="info")
         self._print(f"Modo headless: {self.headless}", style="info")
         
         try:
@@ -433,17 +476,41 @@ Bienvenido al cliente no oficial de DeepSeek con anti-detección avanzada.
         # Loop principal
         while self.is_running:
             try:
-                # Obtener input del usuario
+                # Construir estado interactivo
+                think_txt = "[green]ON[/green]" if self.think_enabled else "[dim]OFF[/dim]"
+                search_txt = "[green]ON[/green]" if self.search_enabled else "[dim]OFF[/dim]"
+                
+                menu_txt = f"\n[bold]Modos:[/bold] [1] 🧠 Think: {think_txt} | [2] 🔍 Search: {search_txt} | [3] Historial | [4] Nuevo Chat"
+                
+                # Obtener input del usuario interactivo
                 if self.console:
-                    user_input = Prompt.ask("\n[bold cyan]Tú[/bold cyan]")
+                    self.console.print(menu_txt)
+                    prompt_str = f"[bold cyan]Tú[/bold cyan] [dim](Escribe mensaje o un numero)[/dim]\n> "
+                    user_input = Prompt.ask(prompt_str)
                 else:
-                    user_input = input("\nTú: ")
+                    print(f"\nModos: [1] Think {self.think_enabled} | [2] Search {self.search_enabled} | [3] Historial | [4] Nuevo")
+                    user_input = input(f"Tú (Escribe mensaje o numero): ")
                 
                 # Ignorar input vacío
                 if not user_input.strip():
                     continue
+                    
+                # Atajos numéricos puros
+                exact_input = user_input.strip()
+                if exact_input == "1":
+                    self.handle_command("/think")
+                    continue
+                elif exact_input == "2":
+                    self.handle_command("/search")
+                    continue
+                elif exact_input == "3":
+                    self.handle_command("/historial")
+                    continue
+                elif exact_input == "4":
+                    self.handle_command("/nuevo")
+                    continue
                 
-                # Manejar comandos (empiezan con /)
+                # Manejar comandos tradicionales (empiezan con /)
                 if user_input.startswith('/'):
                     if not self.handle_command(user_input):
                         break
@@ -509,6 +576,18 @@ Variables de entorno:
     )
     
     parser.add_argument(
+        '--think',
+        action='store_true',
+        help='Activar DeepThink (R1) al iniciar'
+    )
+    
+    parser.add_argument(
+        '--search',
+        action='store_true',
+        help='Activar Búsqueda Web al iniciar'
+    )
+    
+    parser.add_argument(
         '--log-level',
         type=str,
         default='INFO',
@@ -528,7 +607,9 @@ Variables de entorno:
     # Crear y ejecutar chat
     chat = InteractiveChat(
         profile_name=args.profile,
-        headless=args.headless
+        headless=args.headless,
+        initial_think=args.think,
+        initial_search=args.search
     )
     
     # Manejar señales
