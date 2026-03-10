@@ -197,18 +197,34 @@ def chat_completions():
         model = data.get('model', 'deepseek-chat')
         stream = data.get('stream', False)
 
-        # FIX #3: conversation_history era construido pero nunca usado por el cliente.
-        # El contexto de conversación lo mantiene el browser en la sesión de Selenium.
-        # Solo necesitamos el último mensaje de usuario.
-        user_message = None
+        # FIX F4-01: construir el prompt completo con todo el historial de mensajes.
+        # El cliente Selenium mantiene la sesión del browser, pero el contexto
+        # previo del chat solo existe en el browser si la conversación sigue abierta.
+        # Para llamadas multi-turno desde la API, concatenamos el historial completo
+        # en un único mensaje formateado que DeepSeek pueda procesar.
+        parts = []
         for msg in messages:
-            if msg.get('role') == 'user':
-                user_message = msg.get('content', '')
+            role = msg.get('role', 'user')
+            content = msg.get('content', '')
+            if not content:
+                continue
+            if role == 'system':
+                parts.append(f"[Instrucción de sistema]: {content}")
+            elif role == 'assistant':
+                parts.append(f"[Asistente]: {content}")
+            elif role == 'user':
+                parts.append(f"[Usuario]: {content}")
+
+        # Si solo hay un mensaje de usuario, enviarlo directamente sin prefijos
+        if len([m for m in messages if m.get('role') == 'user']) == 1 and len(parts) == 1:
+            user_message = messages[-1].get('content', '')
+        else:
+            user_message = "\n\n".join(parts)
 
         if not user_message:
             return jsonify({"error": "No se encontró mensaje de usuario"}), 400
 
-        logger.info(f"Recibida solicitud: model={model}, stream={stream}, msg_len={len(user_message)}")
+        logger.info(f"Recibida solicitud: model={model}, stream={stream}, msg_len={len(user_message)}, turns={len(messages)}")
 
         if stream:
             return stream_response(user_message, model)

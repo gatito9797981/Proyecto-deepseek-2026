@@ -661,6 +661,13 @@ class DeepSeekClient:
         if separator in full_response:
             clean_response = full_response.split(separator, 1)[-1]
 
+        # FIX F2-05: simular tiempo de lectura humana antes de continuar.
+        # simulate_reading_time estaba importada pero nunca llamada — ahora sí.
+        try:
+            simulate_reading_time(clean_response)
+        except Exception:
+            pass
+
         response = DeepSeekResponse(
             content=clean_response,
             model=self._current_model.value,

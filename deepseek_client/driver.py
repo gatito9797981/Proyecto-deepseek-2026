@@ -85,6 +85,7 @@ class AntiDetectionDriver:
     
     _instance: Optional['AntiDetectionDriver'] = None
     _driver = None
+    _init_lock = __import__('threading').Lock()  # Prevent WinError 32 on concurrent instantiation
     
     def __new__(cls, *args, **kwargs):
         """Implementa patrón singleton opcional."""
@@ -159,14 +160,39 @@ class AntiDetectionDriver:
         
         # Crear driver
         try:
-            if HAS_UNDETECTED:
-                driver = self._create_undetected_driver(options)
-            else:
-                driver = self._create_standard_driver(options)
+            # Serializar la creación nativa del driver para evitar choques en I/O con undetected-chromedriver
+            with self._init_lock:
+                if HAS_UNDETECTED:
+                    driver = self._create_undetected_driver(options)
+                else:
+                    driver = self._create_standard_driver(options)
             
             # Configurar timeouts
             driver.set_page_load_timeout(self.config.page_load_timeout)
             driver.implicitly_wait(5)
+            
+            # FIX F5-04: bloquear SOLO trackers/analítica externos.
+            # Bloquear *.jpg/*.png globalmente también cortaba assets de DeepSeek,
+            # lo que es detectable. Las imágenes de la propia app deben cargarse normal.
+            try:
+                driver.execute_cdp_cmd('Network.enable', {})
+                driver.execute_cdp_cmd('Network.setBlockedURLs', {
+                    "urls": [
+                        "*google-analytics.com*",
+                        "*doubleclick.net*",
+                        "*sentry.io*",
+                        "*datadoghq.com*",
+                        "*hotjar.com*",
+                        "*amplitude.com*",
+                        "*segment.io*",
+                        "*mixpanel.com*",
+                        "*fullstory.com*",
+                        "*heap.io*"
+                    ]
+                })
+                self.logger.info("Reglas CDP de bloqueo de trackers aplicadas (sin bloquear assets propios)")
+            except Exception as e:
+                self.logger.warning(f"No se pudo aplicar el bloqueo CDP: {e}")
             
             # Inyectar scripts de fingerprinting
             self._inject_fingerprint_scripts(driver)
@@ -239,6 +265,14 @@ class AntiDetectionDriver:
             options.add_argument('--headless=new')
             options.add_argument('--disable-gpu')
             options.add_argument('--no-sandbox')
+            
+            # Optimizaciones Extremas de Velocidad (Precaching y Headless Profundo)
+            options.add_argument('--blink-settings=imagesEnabled=false')
+            options.add_argument('--disable-remote-fonts')
+            
+            # Asegurar caché en directorio temporal volátil (Zero-Disk-I/O bottleneck)
+            cache_dir = tempfile.mkdtemp(prefix="ds_speedcache_")
+            options.add_argument(f'--disk-cache-dir={cache_dir}')
         
         # Preferencias adicionales
         prefs = {
@@ -258,6 +292,7 @@ class AntiDetectionDriver:
         # Directorio de perfil de usuario (para persistir cookies)
         profile_dir = os.path.join(self.config.profile_dir, self.profile_id)
         os.makedirs(profile_dir, exist_ok=True)
+        self._clean_profile_cache(profile_dir)  # <-- Limpieza profunda de almacenamiento inútil
         options.add_argument(f'--user-data-dir={profile_dir}')
 
         # Configurar proxy si existe
@@ -282,11 +317,11 @@ class AntiDetectionDriver:
         self.logger.info("Usando undetected-chromedriver")
         
         # Configuración específica de undetected
+        # FIX F3-04: sin version_main → uc detecta la versión real instalada automáticamente
         driver = uc.Chrome(
             options=options,
             use_subprocess=True,  # Usar subproceso para mejor conexión en Windows
             patcher_force_close=False,
-            version_main=145,
         )
         
         return driver
@@ -629,7 +664,7 @@ class AntiDetectionDriver:
         self._post_navigation_behavior()
     
     def close(self):
-        """Cierra el driver."""
+        """Cierra el driver y realiza una limpieza post-mortem."""
         if self._driver:
             try:
                 self._driver.quit()
@@ -638,10 +673,51 @@ class AntiDetectionDriver:
             finally:
                 self._driver = None
                 self._is_initialized = False
+                # Intentar limpiar la caché si es posible luego de cerrar
+                profile_dir = os.path.join(self.config.profile_dir, self.profile_id)
+                self._clean_profile_cache(profile_dir)
     
     def quit(self):
         """Alias para close()."""
         self.close()
+        
+    def _clean_profile_cache(self, profile_dir: str):
+        """
+        Limpia carpetas basura de Chrome que inflan el disco, conservando
+        únicamente la persistencia de cookies de inicio de sesión.
+        """
+        import shutil
+        import stat
+        
+        # Targets conocidos por su enorme consumo de espacio y poco valor transaccional
+        cache_targets = [
+            "Default/Cache",
+            "Default/Code Cache",
+            "Default/Service Worker",
+            "Default/GPUCache",
+            "Default/DawnCache",
+            "GrShaderCache",
+            "ShaderCache",
+            "Crashpad",
+            "GraphiteDawnCache"
+        ]
+        
+        # Función recursiva para forzar borrado saltando permisos de "solo lectura" en Windows
+        def on_rm_error(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+
+        for target in cache_targets:
+            target_path = os.path.join(profile_dir, os.path.normpath(target))
+            if os.path.exists(target_path):
+                try:
+                    shutil.rmtree(target_path, onerror=on_rm_error)
+                    self.logger.debug(f"Purgado: {target}")
+                except Exception as e:
+                    self.logger.debug(f"No se pudo limpiar {target}: {e}")
     
     def enable_spy_mode(self):
         """Inyecta el script de espionaje para monitorear el DOM."""
