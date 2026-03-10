@@ -37,6 +37,7 @@ from .config import Config, config
 from .driver import AntiDetectionDriver, create_driver
 from .history import HistoryManager, Conversation, Message
 from .human_behavior import get_action_delay, simulate_reading_time
+from .token_manager import TokenManager
 
 
 class DeepSeekModel(Enum):
@@ -170,6 +171,7 @@ class DeepSeekClient:
         self._current_model = DeepSeekModel.DEEPSEEK_CHAT
         self._last_response: Optional[DeepSeekResponse] = None
         self._conversation_started = False
+        self._interaction_count = 0  # <--- Trust Score para Bypass JS
 
         self.api_headers = {
             "x-app-version": "20241129.1",
@@ -177,10 +179,19 @@ class DeepSeekClient:
             "x-client-platform": "web"
         }
 
-
+        self.token_manager = TokenManager(
+            driver=self.driver.driver, # Raw Selenium WebDriver
+            logger=self.logger,
+            alert_callback=self._handle_token_alert
+        )
 
         if auto_login:
             self._navigate_to_deepseek()
+
+    def _handle_token_alert(self, message: str):
+        """Callback ejecutado por el TokenManager si la sesión está en peligro."""
+        self.logger.critical(message)
+        print(f"\n\033[91m{message}\033[0m\n")
 
     def _navigate_to_deepseek(self):
         """Navega a DeepSeek de forma optimizada."""
@@ -193,6 +204,9 @@ class DeepSeekClient:
             self._wait_for_chat_input(timeout=30)
             self._is_logged_in = True
             self.logger.info("DeepSeek cargado y sesión detectada correctamente")
+            
+            # Iniciar monitoreo del Token JWT
+            self.token_manager.start_monitoring()
             
         except TimeoutException:
             self.logger.warning("No se detectó el chat input. Es posible que se requiera intervención manual.")
@@ -290,7 +304,7 @@ class DeepSeekClient:
     def _get_send_button(self):
         """Obtiene el botón de enviar usando heurística universal."""
         # 1. Intentar por selector directo (que ahora incluye div[role="button"])
-        element = self._find_element_safe('send_button', timeout=1) or self._find_element_safe('send_button_fallback', timeout=1)
+        element = self._find_element_safe('send_button', timeout=1)
         if element and element.is_displayed() and element.get_attribute("aria-disabled") != "true":
             return element
             
@@ -298,14 +312,41 @@ class DeepSeekClient:
         return self._find_button_by_heuristics(["send", "enviar", "confirmar"])
 
     def _is_generating(self) -> bool:
-        """Verifica si el modelo está generando usando heurística universal."""
-        # 1. Buscar indicador de carga visual
-        loading = self._find_element_safe('generating_indicator', timeout=0.1)
-        if loading: return True
-        
-        # 2. Buscar botón de parar
-        stop_btn = self._find_button_by_heuristics(["stop", "parar", "detener"])
-        return stop_btn is not None
+        """Detecta generación activa por crecimiento del contenido + DOM."""
+        script = """
+        try {
+            // 1. Buscar botón stop por SVG path (más estable que clases)
+            let svgPaths = document.querySelectorAll('path');
+            for (let p of svgPaths) {
+                let d = p.getAttribute('d') || '';
+                // Rectángulo stop de DeepSeek (varias variantes)
+                if (d.startsWith('M2') || d.includes('4.88') || d.includes('19.12')) return true;
+            }
+            
+            // 2. Cualquier elemento con clase que contenga "stop" o "loading"
+            let all = document.querySelectorAll('[class]');
+            for (let el of all) {
+                let cls = el.className || '';
+                if (typeof cls === 'string' && (
+                    cls.includes('stop') || 
+                    cls.includes('loading') || 
+                    cls.includes('generating') ||
+                    cls.includes('blink') ||
+                    cls.includes('cursor')
+                )) return true;
+            }
+            
+            // 3. Input deshabilitado = está generando
+            let textarea = document.querySelector('textarea');
+            if (textarea && textarea.disabled) return true;
+            
+        } catch(e) {}
+        return false;
+        """
+        try:
+            return bool(self.driver.driver.execute_script(script))
+        except Exception:
+            return False
 
     def _wait_for_response(self, timeout: float = None) -> Generator[str, None, None]:
         """
@@ -319,24 +360,41 @@ class DeepSeekClient:
 
         last_content = ""
         stable_count = 0
-        max_stable_checks = 3  # Aumentado para asegurar que la UI esté lista para el próximo mensaje
+        last_growth_time = time.time()  # Track cuándo creció el contenido por última vez
+
+        time.sleep(1.0)  # Esperar montaje inicial de React
 
         while time.time() - start_time < timeout:
             try:
-                is_generating = self._is_generating()
                 content = self._get_response_content()
+                is_gen = self._is_generating()
 
+                # Si el contenido creció, emitir y resetear todo
                 if content and len(content) > len(last_content):
                     new_content = content[len(last_content):]
                     yield new_content
                     last_content = content
                     stable_count = 0
+                    last_growth_time = time.time()
 
-                if not is_generating and content:
+                # Solo considerar "terminado" si:
+                # 1. JS dice que no genera
+                # 2. Contenido no creció en los últimos 4 segundos
+                # 3. stable_count acumuló suficiente
+                time_since_growth = time.time() - last_growth_time
+                
+                if not is_gen and content and time_since_growth > 4.0:
                     stable_count += 1
-                    if stable_count >= max_stable_checks:
-                        self.logger.debug("Respuesta completa detectada")
-                        return  # FIX 3: return sin valor — en generator, return valor es código muerto
+                    if stable_count >= 3:
+                        # Flush final
+                        final = self._get_response_content()
+                        if final and len(final) > len(last_content):
+                            yield final[len(last_content):]
+                        return
+                else:
+                    # Si sigue generando o creció recientemente, resetear stable
+                    if is_gen:
+                        stable_count = 0
 
                 time.sleep(0.1)
 
@@ -351,31 +409,39 @@ class DeepSeekClient:
             raise TimeoutException("Timeout esperando respuesta de DeepSeek")
 
     def _get_response_content(self) -> str:
-        """Obtiene el contenido de la respuesta actual (Detección Heurística)."""
+        """Obtiene el contenido de la respuesta actual directamente en V8 (Zero-Latency)."""
+        script = """
+        try {
+            // Buscamos los bloques de mensaje (solo del asistente filtrando .ds-markdown o ignorando class="user")
+            let blocks = Array.from(document.querySelectorAll('.ds-markdown, div[class*="markdown"]'));
+            if (blocks.length > 0) {
+                // Tomar el texto del último mensaje del asistente
+                let lastBlock = blocks[blocks.length - 1];
+                return lastBlock.innerText || lastBlock.textContent || "";
+            }
+        } catch(e) {}
+        return "";
+        """
         try:
-            # Prioridad 1: Burbujas de mensaje con markdown (usando selectores configurados)
-            for selector in ['message_bubble', 'response_markdown']:
-                by, value = self.SELECTORS[selector]
-                elements = self.driver.driver.find_elements(by, value)
-                if elements:
-                    return elements[-1].text.strip()
-            
-            # Prioridad 2: Buscar bloques markdown o mensajes por clases genéricas
-            md_blocks = self.driver.driver.find_elements(By.CSS_SELECTOR, '.ds-markdown, [class*="markdown"], [class*="message"]')
-            if md_blocks:
-                return md_blocks[-1].text.strip()
-        except Exception as e:
-            self.logger.debug(f"Error detectando contenido heurístico: {e}")
-        return ""
+            return str(self.driver.driver.execute_script(script)).strip()
+        except:
+            return ""
 
     def _get_thinking_content(self) -> str:
-        """Obtiene el contenido del 'pensamiento' (DeepThink) si está disponible."""
+        """Obtiene el contenido del 'pensamiento' (DeepThink R1) desde V8 (Zero-Latency)."""
+        script = """
+        try {
+            let blocks = Array.from(document.querySelectorAll('.ds-thought, [class*="think"]'));
+            if (blocks.length > 0) {
+                let lastBlock = blocks[blocks.length - 1];
+                return lastBlock.innerText || lastBlock.textContent || "";
+            }
+        } catch(e) {}
+        return "";
+        """
         try:
-            by, value = self.SELECTORS['thinking_content']
-            elements = self.driver.driver.find_elements(by, value)
-            return elements[-1].text.strip() if elements else ""
-        except Exception as e:
-            self.logger.debug(f"Error obteniendo pensamiento: {e}")
+            return str(self.driver.driver.execute_script(script)).strip()
+        except:
             return ""
 
     def _check_for_errors(self) -> Optional[str]:
@@ -394,28 +460,56 @@ class DeepSeekClient:
     def _send_message(self, message: str) -> None:
         """
         Envía un mensaje a DeepSeek con redundancia ante fallos de UI.
-
-        Args:
-            message: Mensaje a enviar
+        Incorpora un Bypass JS "Atómico" de latencia nula si ya hay Trust Score.
         """
         for attempt in range(2):
             try:
                 chat_input = self._get_chat_input()
-                # FIX #4: human_type siempre, no solo en attempt=0
-                # En retry el input puede estar vacío (stale tras refetch)
-                self.driver.human_type(chat_input, message, clear_first=True)
-                time.sleep(random.uniform(0.3, 0.6))
                 send_button = self._get_send_button()
-                if send_button and send_button.is_enabled():
-                    try:
-                        self.driver.driver.execute_script("arguments[0].click();", send_button)
-                        time.sleep(0.3)
-                    except Exception as e:
-                        self.logger.warning(f"Fallo clic JS, usando Ctrl+Enter: {e}")
-                        chat_input.send_keys(Keys.CONTROL, Keys.RETURN)
+                
+                # Zero-Latency JS Bypass: Si ya demostramos humanidad 2 veces, inyecar texto atómicamente
+                if getattr(self, '_interaction_count', 0) >= 2 and send_button:
+                    self.logger.info("🚀 Usando Bypass Atómico JS para escribir sin latencia humana...")
+                    script = """
+                    let input = arguments[0];
+                    let text = arguments[1];
+                    let btn = arguments[2];
+                    
+                    // Rellenar contenido engañando al State de React
+                    let nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+                    nativeInputValueSetter.call(input, text);
+                    // React 15+ requiere ambos eventos y con bubbles: true
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    
+                    // Asegurar que React detecte el cambio de estado antes del clic
+                    setTimeout(() => {
+                        if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                            btn.click();
+                        }
+                    }, 50);
+                    """
+                    self.driver.driver.execute_script(script, chat_input, message, send_button)
+                    self._interaction_count += 1
+                    time.sleep(0.1) # Breve pausa por el setTimeout
                 else:
-                    # Fallback directo a teclas de envío si no hay botón
-                    chat_input.send_keys(Keys.CONTROL, Keys.RETURN)
+                    self.logger.info(f"Escritura lenta de validación humana en curso... (Trust Score: {getattr(self, '_interaction_count', 0)}/2)")
+                    self.driver.human_type(chat_input, message, clear_first=True)
+                    time.sleep(random.uniform(0.3, 0.6))
+                    send_button = self._get_send_button()
+                    if send_button and send_button.is_enabled():
+                        try:
+                            self.driver.driver.execute_script("arguments[0].click();", send_button)
+                            time.sleep(0.3)
+                        except Exception as e:
+                            self.logger.warning(f"Fallo clic JS, usando Ctrl+Enter: {e}")
+                            chat_input.send_keys(Keys.CONTROL, Keys.RETURN)
+                    else:
+                        # Fallback directo a teclas de envío si no hay botón
+                        chat_input.send_keys(Keys.CONTROL, Keys.RETURN)
+                        
+                    if hasattr(self, '_interaction_count'):
+                        self._interaction_count += 1
                 
                 self.logger.info(f"Mensaje enviado (intento {attempt+1})")
                 return
@@ -590,6 +684,7 @@ class DeepSeekClient:
             self.history.save_conversation()
  
         self.history.new_conversation()
+        self._interaction_count = 0  # <--- Resetear contador de Bypass JS (Fix 4)
  
         # Intentar encontrar botón de "New Chat" por heurística
         new_chat_btn = self._find_element_safe('new_chat_button', timeout=1) or \
@@ -687,6 +782,12 @@ class DeepSeekClient:
                     file_input = self._find_element_safe('file_upload', timeout=3)
 
             if file_input:
+                # Desenmascarar el input si está oculto (común en apps web modernas)
+                self.driver.driver.execute_script(
+                    "arguments[0].style.display = 'block'; arguments[0].style.visibility = 'visible';", 
+                    file_input
+                )
+                time.sleep(0.2)
                 file_input.send_keys(file_path)
                 time.sleep(2)
                 return True
@@ -734,6 +835,12 @@ class DeepSeekClient:
 
     def close(self):
         """Cierra el cliente y el navegador."""
+        try:
+            if hasattr(self, 'token_manager'):
+                self.token_manager.stop_monitoring()
+        except Exception:
+            pass
+
         # FIX 5: guards para __init__ parcialmente fallido
         try:
             if hasattr(self, 'history') and self.history.current_conversation.messages:
